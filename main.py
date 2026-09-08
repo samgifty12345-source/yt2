@@ -121,6 +121,264 @@ def get_google_creds(scopes, refresh_token, client_id, client_secret):
     )
 
 
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TikTok -> YouTube Bot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0b10; --panel: #14141c; --panel-2: #1b1b26; --border: #26263a;
+    --text: #eaeaf2; --muted: #8a8aa0; --accent: #ff3b5c; --accent-2: #7c5cff; --ok: #35d488;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,0.18), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(255,59,92,0.14), transparent 55%), var(--bg);
+    color: var(--text); padding: 32px 20px 60px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  .logo { width: 42px; height: 42px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; flex-shrink: 0; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .badge { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
+  .badge b { color: var(--text); }
+  .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
+  .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
+  label:first-of-type { margin-top: 0; }
+  textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent-2); }
+  input[type=text], select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
+  .account-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .account-row input[type=text] { flex: 1; }
+  .account-row select { flex: 1; }
+  .account-row button { width: auto; margin-top: 0; padding: 8px 12px; }
+  button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
+    cursor: pointer; letter-spacing: 0.01em; }
+  button:hover { filter: brightness(1.08); }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  .log { background: #08080d; border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+    font-size: 12px; color: #8fe3a8; font-family: "SF Mono", Menlo, Consolas, monospace;
+    max-height: 360px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">TT&gt;YT</div>
+    <div>
+      <h1>TikTok -&gt; YouTube Bot</h1>
+      <div class="sub">Watches TikTok accounts, reposts new videos to YouTube automatically</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Status</h2>
+      <div class="badges">
+        <div class="badge">Posted <b>@@DONE_COUNT@@</b></div>
+        <div class="badge">Checking every <b>@@INTERVAL@@h</b></div>
+        <div class="badge @@YT_WARN_CLASS@@">YouTube channels <b>@@YT_COUNT@@</b></div>
+        <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
+      </div>
+      <div class="log">@@LOG_CONTENT@@</div>
+      <form method="POST" action="/trigger">
+        <button type="submit">Check All Now</button>
+      </form>
+      <div class="hint">Checks every monitored account immediately instead of waiting for the next scheduled check.</div>
+    </div>
+
+    <div class="card">
+      <h2>Monitored Accounts</h2>
+      <form method="POST" action="/configure">
+        <label>Each row is one profile: a TikTok account paired with the YouTube channel it posts to.</label>
+        <div id="accountRows">
+@@ACCOUNT_ROWS@@
+        </div>
+        <button type="button" class="secondary" onclick="addRow()">+ Add Account</button>
+        <button type="submit">Save Accounts</button>
+      </form>
+      <div class="hint">
+        Every check cycle, the bot looks at each TikTok account's last @@LOOKBACK@@ videos. Any
+        that aren't already posted for that profile get queued up, oldest first, one upload per
+        cycle, to the YouTube channel selected for that row - so nothing gets silently skipped
+        even if several videos land between checks.
+        @@YT_HINT@@
+      </div>
+    </div>
+  </div>
+
+  <footer>First check runs @@STARTUP_WAIT@@h after boot &middot; next run in @@NEXT_RUN_IN@@</footer>
+</div>
+
+<script>
+let rowIndex = @@ROW_COUNT@@;
+function addRow() {
+  const div = document.createElement('div');
+  div.className = 'account-row';
+  div.innerHTML = `
+    <input type="text" name="tiktok_${rowIndex}" placeholder="tiktok username">
+    <select name="youtube_${rowIndex}">@@YOUTUBE_OPTIONS_JS@@</select>
+    <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  document.getElementById('accountRows').appendChild(div);
+  rowIndex++;
+}
+</script>
+</body>
+</html>"""
+
+
+def format_countdown(target_epoch):
+    remaining = int(target_epoch - time.time())
+    if remaining <= 0:
+        return "any moment"
+    h, rem = divmod(remaining, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def esc(s):
+    return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def youtube_options_html(selected=""):
+    if not YOUTUBE_ACCOUNTS:
+        return '<option value="">No YouTube accounts configured</option>'
+    opts = []
+    for acc in YOUTUBE_ACCOUNTS:
+        sel = " selected" if acc["id"] == selected else ""
+        opts.append(f'<option value="{esc(acc["id"])}"{sel}>{esc(acc["label"])}</option>')
+    return "\n".join(opts)
+
+
+def render_account_rows(accounts):
+    rows_source = accounts if accounts else [{"tiktok": "", "youtube": ""}]
+    rows = []
+    for i, acc in enumerate(rows_source):
+        rows.append(
+            f'<div class="account-row">\n'
+            f'  <input type="text" name="tiktok_{i}" value="{esc(acc.get("tiktok", ""))}" placeholder="tiktok username">\n'
+            f'  <select name="youtube_{i}">{youtube_options_html(acc.get("youtube", ""))}</select>\n'
+            f'  <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>\n'
+            f'</div>'
+        )
+    return "\n".join(rows), len(rows_source)
+
+
+def render_page():
+    history = load_history()
+    done_count = sum(len(get_posted_ids(history, k)) for k in history)
+    with log_lock:
+        log_text = "\n".join(pipeline_log[-40:])
+    with pipeline_state_lock:
+        running = pipeline_running
+
+    cfg = get_config()
+    rows_html, row_count = render_account_rows(cfg["accounts"])
+
+    yt_hint = ""
+    if not YOUTUBE_ACCOUNTS:
+        yt_hint = " No YouTube accounts are configured yet - set YOUTUBE_ACCOUNTS_JSON (or the legacy YOUTUBE_REFRESH_TOKEN) before saving accounts."
+
+    html = PAGE_TEMPLATE
+    html = html.replace("@@DONE_COUNT@@", str(done_count))
+    html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL_HOURS))
+    html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
+    html = html.replace("@@RUNNING_TEXT@@", "Checking now" if running else "Idle")
+    html = html.replace("@@YT_COUNT@@", str(len(YOUTUBE_ACCOUNTS)))
+    html = html.replace("@@YT_WARN_CLASS@@", "warn" if not YOUTUBE_ACCOUNTS else "")
+    html = html.replace("@@YT_HINT@@", yt_hint)
+    html = html.replace("@@LOG_CONTENT@@", log_text)
+    html = html.replace("@@ACCOUNT_ROWS@@", rows_html)
+    html = html.replace("@@ROW_COUNT@@", str(row_count))
+    html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
+    html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
+    html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
+    html = html.replace("@@LOOKBACK@@", str(LOOKBACK_COUNT))
+    return html
+
+
+def parse_accounts_from_form(fields_multi):
+    indices = set()
+    for key in fields_multi:
+        if key.startswith("tiktok_"):
+            suffix = key[len("tiktok_"):]
+            if suffix.isdigit():
+                indices.add(int(suffix))
+
+    accounts = []
+    for i in sorted(indices):
+        tiktok = fields_multi.get(f"tiktok_{i}", [""])[0].strip().lstrip("@")
+        youtube = fields_multi.get(f"youtube_{i}", [""])[0].strip()
+        if not tiktok:
+            continue
+        if not youtube and YOUTUBE_ACCOUNTS:
+            youtube = YOUTUBE_ACCOUNTS[0]["id"]
+        accounts.append({"tiktok": tiktok, "youtube": youtube})
+    return accounts
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        html = render_page()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        body = html.encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path == "/configure":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else ""
+            fields_multi = urllib.parse.parse_qs(body)
+            accounts = parse_accounts_from_form(fields_multi)
+            with config_lock:
+                CONFIG["accounts"] = accounts
+            summary = ", ".join(f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])}" for a in accounts)
+            log(f"Accounts updated -> {summary if accounts else '(none)'}")
+        elif self.path == "/trigger":
+            log("Manual trigger received - checking all accounts now.")
+            trigger_event.set()
+
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_server():
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
 def get_recent_tiktok_videos(username, limit=5):
     profile_url = f"https://www.tiktok.com/@{username}"
     ydl_opts = {
@@ -388,6 +646,7 @@ def main():
         log("WARNING: No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON "
             "(or the legacy YOUTUBE_REFRESH_TOKEN) or uploads will fail.")
 
+    threading.Thread(target=start_server, daemon=True).start()
     threading.Thread(target=autopilot_loop, daemon=True).start()
     log("Bot started.")
     while True:
