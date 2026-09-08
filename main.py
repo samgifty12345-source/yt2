@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import subprocess
 import tempfile
 import threading
 import urllib.parse
@@ -22,8 +23,15 @@ HISTORY_FILE = "posted_history.json"  # {username: last_posted_video_id}
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
 
 # Minimum acceptable downloaded file size in bytes. Below this, we assume
-# the download was blocked/corrupted rather than a real video.
-MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "100000"))  # ~100KB
+# the download was blocked/corrupted rather than a real video. Real TikTok
+# videos are almost always well over 500KB, so this is a first-pass filter -
+# the real check is the ffprobe duration check below.
+MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))  # ~300KB
+
+# Minimum playable duration (seconds) required by ffprobe for a download to
+# be considered real. Catches corrupt/blocked responses that pass the size
+# check but aren't actually valid, playable video.
+MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", "1.0"))
 
 # How often the bot checks each monitored account for a new video.
 POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "1"))
@@ -305,11 +313,33 @@ def get_latest_tiktok_video(username):
     }
 
 
+def probe_duration_seconds(filepath):
+    """Returns the video's duration in seconds via ffprobe, or None if
+    ffprobe isn't available or the file isn't a valid/playable video."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 def download_tiktok_video(video_url, filepath):
     """Downloads the video and validates the result. Raises RuntimeError if
-    the file is missing or suspiciously small (usually means TikTok blocked
-    the request and yt_dlp saved an error page/empty response instead of a
-    real video - this is what causes YouTube's "Processing abandoned")."""
+    the file is missing, suspiciously small, or not a real playable video
+    (usually means TikTok blocked the request and yt_dlp saved an error
+    page/short garbage clip instead of the real video - this is what causes
+    YouTube's "Processing abandoned")."""
+    log(f"  Fetching: {video_url}")
     dl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -330,10 +360,25 @@ def download_tiktok_video(video_url, filepath):
         raise RuntimeError(
             f"Downloaded file too small ({size} bytes) - likely blocked by TikTok "
             f"or got an error response instead of the real video. "
-            f"Set TIKTOK_COOKIES_FILE to a fresh cookies.txt to fix this."
+            f"Check TIKTOK_COOKIES_FILE is set to a fresh, TikTok-only cookies.txt."
         )
 
-    log(f"  Download OK ({size / 1_000_000:.1f} MB)")
+    duration = probe_duration_seconds(filepath)
+    if duration is None:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"File downloaded ({size / 1_000_000:.1f} MB) but ffprobe couldn't read it "
+            f"as a valid video - it's corrupt or not actually a video file. "
+            f"Likely a blocked/error response from TikTok, not a real download."
+        )
+    if duration < MIN_VALID_DURATION_SECONDS:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"File downloaded ({size / 1_000_000:.1f} MB) but duration is only "
+            f"{duration:.2f}s - too short to be real, likely corrupt/blocked."
+        )
+
+    log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
 
 
 def upload_to_youtube(file_path, title, description):
@@ -438,6 +483,16 @@ def autopilot_loop():
 
 
 def main():
+    if TIKTOK_COOKIES_FILE:
+        if os.path.exists(TIKTOK_COOKIES_FILE):
+            n_lines = sum(1 for _ in open(TIKTOK_COOKIES_FILE))
+            log(f"Cookies file found at '{TIKTOK_COOKIES_FILE}' ({n_lines} lines).")
+        else:
+            log(f"WARNING: TIKTOK_COOKIES_FILE is set to '{TIKTOK_COOKIES_FILE}' but that "
+                f"path doesn't exist - cookies will NOT be used. Check the path/env var.")
+    else:
+        log("WARNING: No TIKTOK_COOKIES_FILE set - requests are unauthenticated and "
+            "much more likely to get blocked by TikTok.")
     threading.Thread(target=start_server, daemon=True).start()
     threading.Thread(target=autopilot_loop, daemon=True).start()
     log("Bot started.")
