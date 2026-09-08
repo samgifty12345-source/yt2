@@ -78,15 +78,32 @@ def log(msg):
 # YouTube accounts (multiple destination channels)
 # ---------------------------------------------------------------------------
 # Each TikTok account you monitor gets paired with one of these as its post
-# destination. A single Google Cloud OAuth app (YOUTUBE_CLIENT_ID/SECRET) is
-# shared across all of them - what differs per channel is the refresh_token,
-# because each channel/account has to authorize that app separately.
+# destination.
+#
+# Each YouTube channel needs its own refresh_token (because each channel has
+# to authorize an OAuth app separately), but different channels can also use
+# *different* OAuth client apps (client_id/client_secret) - useful when each
+# channel lives on a different Google account and you created a separate
+# Cloud project/OAuth client for it.
+#
+# Client credentials are resolved per-account like this, in order:
+#   1. "client_id" / "client_secret" fields directly on the account object
+#      in YOUTUBE_ACCOUNTS_JSON (highest priority, most explicit).
+#   2. Numbered env vars matching the account's position in the list:
+#      the 1st account -> YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
+#      the 2nd account -> YOUTUBE_CLIENT_ID2 / YOUTUBE_CLIENT_SECRET2
+#      the 3rd account -> YOUTUBE_CLIENT_ID3 / YOUTUBE_CLIENT_SECRET3, etc.
+#   3. Falls back to the plain YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
+#      (so a single shared OAuth app still works exactly as before if you
+#      don't set any numbered/per-account vars).
 #
 # Set YOUTUBE_ACCOUNTS_JSON to a JSON array like:
 # [
-#   {"id": "main",   "label": "My Main Channel",   "refresh_token": "1//..."},
-#   {"id": "gaming", "label": "My Gaming Channel",  "refresh_token": "1//..."}
+#   {"id": "default",  "label": "jason_animation", "refresh_token": "1//..."},
+#   {"id": "channel2", "label": "Jason Shorts",     "refresh_token": "1//..."}
 # ]
+# -> here "default" will use YOUTUBE_CLIENT_ID/SECRET and "channel2" will use
+#    YOUTUBE_CLIENT_ID2/SECRET2 automatically, by position.
 #
 # The old single-account YOUTUBE_REFRESH_TOKEN env var still works and is
 # auto-added as an account with id "default", for backward compatibility.
@@ -105,6 +122,23 @@ def load_youtube_accounts():
     legacy_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
     if legacy_token and not any(a["id"] == "default" for a in accounts):
         accounts.insert(0, {"id": "default", "label": "Default Channel", "refresh_token": legacy_token})
+
+    # Resolve OAuth client credentials for each account, by position.
+    # account 0 -> YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
+    # account 1 -> YOUTUBE_CLIENT_ID2 / YOUTUBE_CLIENT_SECRET2
+    # account 2 -> YOUTUBE_CLIENT_ID3 / YOUTUBE_CLIENT_SECRET3, etc.
+    default_client_id = os.environ.get("YOUTUBE_CLIENT_ID", "")
+    default_client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+
+    for i, acc in enumerate(accounts):
+        suffix = "" if i == 0 else str(i + 1)
+        env_client_id = os.environ.get(f"YOUTUBE_CLIENT_ID{suffix}", "")
+        env_client_secret = os.environ.get(f"YOUTUBE_CLIENT_SECRET{suffix}", "")
+
+        # Priority: explicit per-account fields in the JSON > numbered env
+        # var for this position > fallback to the plain default client.
+        acc["client_id"] = acc.get("client_id") or env_client_id or default_client_id
+        acc["client_secret"] = acc.get("client_secret") or env_client_secret or default_client_secret
 
     return accounts
 
@@ -147,13 +181,13 @@ def get_posted_ids(history, history_key):
     return []
 
 
-def get_google_creds(scopes, refresh_token):
+def get_google_creds(scopes, refresh_token, client_id, client_secret):
     return Credentials(
         token=None,
         refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YOUTUBE_CLIENT_ID"],
-        client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+        client_id=client_id,
+        client_secret=client_secret,
         scopes=scopes,
     )
 
@@ -533,9 +567,24 @@ def upload_to_youtube(file_path, title, description, youtube_account_id):
     if not account:
         log(f"  Upload failed: no YouTube account configured for id '{youtube_account_id}'")
         return None
+
+    client_id = account.get("client_id")
+    client_secret = account.get("client_secret")
+    if not client_id or not client_secret:
+        log(f"  Upload failed: no OAuth client_id/client_secret resolved for "
+            f"'{account['label']}'. Set YOUTUBE_CLIENT_ID/SECRET (default) or a "
+            f"numbered pair like YOUTUBE_CLIENT_ID2/YOUTUBE_CLIENT_SECRET2 for "
+            f"this account's position in YOUTUBE_ACCOUNTS_JSON.")
+        return None
+
     log(f"  Uploading to YouTube ({account['label']})...")
     try:
-        creds = get_google_creds(["https://www.googleapis.com/auth/youtube.upload"], account["refresh_token"])
+        creds = get_google_creds(
+            ["https://www.googleapis.com/auth/youtube.upload"],
+            account["refresh_token"],
+            client_id,
+            client_secret,
+        )
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
         body = {
@@ -673,8 +722,10 @@ def main():
             "much more likely to get blocked by TikTok.")
 
     if YOUTUBE_ACCOUNTS:
-        labels = ", ".join(a["label"] for a in YOUTUBE_ACCOUNTS)
-        log(f"YouTube accounts loaded: {labels}")
+        for acc in YOUTUBE_ACCOUNTS:
+            has_client = bool(acc.get("client_id") and acc.get("client_secret"))
+            client_note = "OK" if has_client else "MISSING client_id/client_secret!"
+            log(f"YouTube account loaded: {acc['label']} (id={acc['id']}) - OAuth client: {client_note}")
     else:
         log("WARNING: No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON "
             "(or the legacy YOUTUBE_REFRESH_TOKEN) or uploads will fail.")
