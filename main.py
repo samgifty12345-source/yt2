@@ -15,10 +15,15 @@ from googleapiclient.http import MediaFileUpload
 WORK_DIR = tempfile.gettempdir()
 HISTORY_FILE = "posted_history.json"  # {username: last_posted_video_id}
 
-# Optional: path to a cookies.txt exported from a logged-in browser session.
-# Only needed if TikTok starts blocking requests from your server's IP
-# (common on cloud hosts) - see README.
+# Path to a cookies.txt file (relative paths resolve against the repo root
+# on Railway, e.g. "cookies.txt" if it's committed at the repo root).
+# Strongly recommended - without this, cloud-host IPs get blocked by TikTok
+# and yt_dlp can silently return a tiny/broken file instead of erroring.
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
+
+# Minimum acceptable downloaded file size in bytes. Below this, we assume
+# the download was blocked/corrupted rather than a real video.
+MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "100000"))  # ~100KB
 
 # How often the bot checks each monitored account for a new video.
 POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "1"))
@@ -301,6 +306,10 @@ def get_latest_tiktok_video(username):
 
 
 def download_tiktok_video(video_url, filepath):
+    """Downloads the video and validates the result. Raises RuntimeError if
+    the file is missing or suspiciously small (usually means TikTok blocked
+    the request and yt_dlp saved an error page/empty response instead of a
+    real video - this is what causes YouTube's "Processing abandoned")."""
     dl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -311,6 +320,20 @@ def download_tiktok_video(video_url, filepath):
         dl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
     with yt_dlp.YoutubeDL(dl_opts) as ydl:
         ydl.download([video_url])
+
+    if not os.path.exists(filepath):
+        raise RuntimeError("Download reported success but no file was written")
+
+    size = os.path.getsize(filepath)
+    if size < MIN_VALID_FILE_BYTES:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"Downloaded file too small ({size} bytes) - likely blocked by TikTok "
+            f"or got an error response instead of the real video. "
+            f"Set TIKTOK_COOKIES_FILE to a fresh cookies.txt to fix this."
+        )
+
+    log(f"  Download OK ({size / 1_000_000:.1f} MB)")
 
 
 def upload_to_youtube(file_path, title, description):
