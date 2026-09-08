@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 WORK_DIR = tempfile.gettempdir()
-HISTORY_FILE = "posted_history.json"  # {username: last_posted_video_id}
+HISTORY_FILE = "posted_history.json"  # {"tiktok::youtube_id": last_posted_video_id}
 
 # Path to a cookies.txt file (relative paths resolve against the repo root
 # on Railway, e.g. "cookies.txt" if it's committed at the repo root).
@@ -58,9 +58,6 @@ pipeline_running = False
 trigger_event = threading.Event()
 next_run_at = [time.time() + STARTUP_WAIT_HOURS * 3600]
 
-config_lock = threading.Lock()
-CONFIG = {"usernames": _seed_usernames}
-
 
 def log(msg):
     print(msg, flush=True)
@@ -68,6 +65,51 @@ def log(msg):
         pipeline_log.append(msg)
         if len(pipeline_log) > 100:
             pipeline_log.pop(0)
+
+
+# ---------------------------------------------------------------------------
+# YouTube accounts (multiple destination channels)
+# ---------------------------------------------------------------------------
+# Each TikTok account you monitor gets paired with one of these as its post
+# destination. A single Google Cloud OAuth app (YOUTUBE_CLIENT_ID/SECRET) is
+# shared across all of them - what differs per channel is the refresh_token,
+# because each channel/account has to authorize that app separately.
+#
+# Set YOUTUBE_ACCOUNTS_JSON to a JSON array like:
+# [
+#   {"id": "main",   "label": "My Main Channel",   "refresh_token": "1//..."},
+#   {"id": "gaming", "label": "My Gaming Channel",  "refresh_token": "1//..."}
+# ]
+#
+# The old single-account YOUTUBE_REFRESH_TOKEN env var still works and is
+# auto-added as an account with id "default", for backward compatibility.
+
+def load_youtube_accounts():
+    raw = os.environ.get("YOUTUBE_ACCOUNTS_JSON", "")
+    accounts = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                accounts = [a for a in parsed if a.get("id") and a.get("refresh_token")]
+        except json.JSONDecodeError:
+            log("WARNING: YOUTUBE_ACCOUNTS_JSON is not valid JSON - ignoring it.")
+
+    legacy_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
+    if legacy_token and not any(a["id"] == "default" for a in accounts):
+        accounts.insert(0, {"id": "default", "label": "Default Channel", "refresh_token": legacy_token})
+
+    return accounts
+
+
+YOUTUBE_ACCOUNTS = load_youtube_accounts()
+YOUTUBE_ACCOUNTS_BY_ID = {a["id"]: a for a in YOUTUBE_ACCOUNTS}
+
+config_lock = threading.Lock()
+_default_youtube_id = YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else ""
+CONFIG = {
+    "accounts": [{"tiktok": u, "youtube": _default_youtube_id} for u in _seed_usernames]
+}
 
 
 def get_config():
@@ -87,10 +129,10 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 
-def get_google_creds(scopes):
+def get_google_creds(scopes, refresh_token):
     return Credentials(
         token=None,
-        refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+        refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["YOUTUBE_CLIENT_ID"],
         client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
@@ -136,11 +178,19 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
   .badge b { color: var(--text); }
   .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
+  .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
   label:first-of-type { margin-top: 0; }
   textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
     padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit; resize: vertical; }
   textarea:focus { outline: none; border-color: var(--accent-2); }
+  input[type=text], select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
+  .account-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .account-row input[type=text] { flex: 1; }
+  .account-row select { flex: 1; }
+  .account-row button { width: auto; margin-top: 0; padding: 8px 12px; }
   button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
     color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
     cursor: pointer; letter-spacing: 0.01em; }
@@ -169,6 +219,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <div class="badges">
         <div class="badge">Posted <b>@@DONE_COUNT@@</b></div>
         <div class="badge">Checking every <b>@@INTERVAL@@h</b></div>
+        <div class="badge @@YT_WARN_CLASS@@">YouTube channels <b>@@YT_COUNT@@</b></div>
         <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
       </div>
       <div class="log">@@LOG_CONTENT@@</div>
@@ -179,22 +230,41 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Monitored TikTok Accounts</h2>
+      <h2>Monitored Accounts</h2>
       <form method="POST" action="/configure">
-        <label>Usernames (one per line, no @)</label>
-        <textarea name="usernames" rows="6" placeholder="someusername&#10;anotheruser">@@USERNAMES@@</textarea>
-        <button type="submit" class="secondary">Save Accounts</button>
+        <label>Each row is one profile: a TikTok account paired with the YouTube channel it posts to.</label>
+        <div id="accountRows">
+@@ACCOUNT_ROWS@@
+        </div>
+        <button type="button" class="secondary" onclick="addRow()">+ Add Account</button>
+        <button type="submit">Save Accounts</button>
       </form>
       <div class="hint">
-        Every check cycle, the bot looks at each account's latest video. If it's new
-        (not already posted), it downloads it and uploads it to your YouTube channel,
-        then remembers it so it's never posted twice.
+        Every check cycle, the bot looks at each TikTok account's latest video. If it's new
+        (not already posted for that profile), it downloads it and uploads it to the YouTube
+        channel selected for that row, then remembers it so it's never posted twice.
+        @@YT_HINT@@
       </div>
     </div>
   </div>
 
   <footer>First check runs @@STARTUP_WAIT@@h after boot &middot; next run in @@NEXT_RUN_IN@@</footer>
 </div>
+
+<script>
+let rowIndex = @@ROW_COUNT@@;
+function addRow() {
+  const div = document.createElement('div');
+  div.className = 'account-row';
+  div.innerHTML = `
+    <input type="text" name="tiktok_${rowIndex}" placeholder="tiktok username">
+    <select name="youtube_${rowIndex}">@@YOUTUBE_OPTIONS_JS@@</select>
+    <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  document.getElementById('accountRows').appendChild(div);
+  rowIndex++;
+}
+</script>
 </body>
 </html>"""
 
@@ -212,6 +282,34 @@ def format_countdown(target_epoch):
     return f"{s}s"
 
 
+def esc(s):
+    return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def youtube_options_html(selected=""):
+    if not YOUTUBE_ACCOUNTS:
+        return '<option value="">No YouTube accounts configured</option>'
+    opts = []
+    for acc in YOUTUBE_ACCOUNTS:
+        sel = " selected" if acc["id"] == selected else ""
+        opts.append(f'<option value="{esc(acc["id"])}"{sel}>{esc(acc["label"])}</option>')
+    return "\n".join(opts)
+
+
+def render_account_rows(accounts):
+    rows_source = accounts if accounts else [{"tiktok": "", "youtube": ""}]
+    rows = []
+    for i, acc in enumerate(rows_source):
+        rows.append(
+            f'<div class="account-row">\n'
+            f'  <input type="text" name="tiktok_{i}" value="{esc(acc.get("tiktok", ""))}" placeholder="tiktok username">\n'
+            f'  <select name="youtube_{i}">{youtube_options_html(acc.get("youtube", ""))}</select>\n'
+            f'  <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>\n'
+            f'</div>'
+        )
+    return "\n".join(rows), len(rows_source)
+
+
 def render_page():
     history = load_history()
     done_count = len(history)
@@ -221,24 +319,49 @@ def render_page():
         running = pipeline_running
 
     cfg = get_config()
-    usernames_text = "\n".join(cfg["usernames"])
+    rows_html, row_count = render_account_rows(cfg["accounts"])
+
+    yt_hint = ""
+    if not YOUTUBE_ACCOUNTS:
+        yt_hint = " No YouTube accounts are configured yet - set YOUTUBE_ACCOUNTS_JSON (or the legacy YOUTUBE_REFRESH_TOKEN) before saving accounts."
 
     html = PAGE_TEMPLATE
     html = html.replace("@@DONE_COUNT@@", str(done_count))
     html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL_HOURS))
     html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
     html = html.replace("@@RUNNING_TEXT@@", "Checking now" if running else "Idle")
+    html = html.replace("@@YT_COUNT@@", str(len(YOUTUBE_ACCOUNTS)))
+    html = html.replace("@@YT_WARN_CLASS@@", "warn" if not YOUTUBE_ACCOUNTS else "")
+    html = html.replace("@@YT_HINT@@", yt_hint)
     html = html.replace("@@LOG_CONTENT@@", log_text)
-    html = html.replace("@@USERNAMES@@", usernames_text)
+    html = html.replace("@@ACCOUNT_ROWS@@", rows_html)
+    html = html.replace("@@ROW_COUNT@@", str(row_count))
+    html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
     html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
     html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
     return html
 
 
-def parse_post_body(handler):
-    length = int(handler.headers.get("Content-Length", 0))
-    body = handler.rfile.read(length).decode() if length else ""
-    return {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+def parse_accounts_from_form(fields_multi):
+    """fields_multi: dict of key -> list[str] from urllib.parse.parse_qs.
+    Reads tiktok_N / youtube_N pairs and returns the accounts list."""
+    indices = set()
+    for key in fields_multi:
+        if key.startswith("tiktok_"):
+            suffix = key[len("tiktok_"):]
+            if suffix.isdigit():
+                indices.add(int(suffix))
+
+    accounts = []
+    for i in sorted(indices):
+        tiktok = fields_multi.get(f"tiktok_{i}", [""])[0].strip().lstrip("@")
+        youtube = fields_multi.get(f"youtube_{i}", [""])[0].strip()
+        if not tiktok:
+            continue
+        if not youtube and YOUTUBE_ACCOUNTS:
+            youtube = YOUTUBE_ACCOUNTS[0]["id"]
+        accounts.append({"tiktok": tiktok, "youtube": youtube})
+    return accounts
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -253,16 +376,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/configure":
-            fields = parse_post_body(self)
-            raw = fields.get("usernames", "")
-            usernames = []
-            for line in raw.replace(",", "\n").splitlines():
-                u = line.strip().lstrip("@")
-                if u and u not in usernames:
-                    usernames.append(u)
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else ""
+            fields_multi = urllib.parse.parse_qs(body)
+            accounts = parse_accounts_from_form(fields_multi)
             with config_lock:
-                CONFIG["usernames"] = usernames
-            log(f"Accounts updated -> {', '.join(usernames) if usernames else '(none)'}")
+                CONFIG["accounts"] = accounts
+            summary = ", ".join(f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])}" for a in accounts)
+            log(f"Accounts updated -> {summary if accounts else '(none)'}")
         elif self.path == "/trigger":
             log("Manual trigger received - checking all accounts now.")
             trigger_event.set()
@@ -381,10 +502,14 @@ def download_tiktok_video(video_url, filepath):
     log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
 
 
-def upload_to_youtube(file_path, title, description):
-    log("  Uploading to YouTube...")
+def upload_to_youtube(file_path, title, description, youtube_account_id):
+    account = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_account_id)
+    if not account:
+        log(f"  Upload failed: no YouTube account configured for id '{youtube_account_id}'")
+        return None
+    log(f"  Uploading to YouTube ({account['label']})...")
     try:
-        creds = get_google_creds(["https://www.googleapis.com/auth/youtube.upload"])
+        creds = get_google_creds(["https://www.googleapis.com/auth/youtube.upload"], account["refresh_token"])
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
         body = {
@@ -404,8 +529,18 @@ def upload_to_youtube(file_path, title, description):
         return None
 
 
-def check_account(username, history):
-    log(f"Checking @{username}...")
+def check_account(account, history):
+    username = account["tiktok"]
+    youtube_id = account.get("youtube") or (YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else "")
+    yt_label = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_id, {}).get("label", youtube_id or "no channel set")
+    history_key = f"{username}::{youtube_id}"
+
+    log(f"Checking @{username} (-> {yt_label})...")
+
+    if not youtube_id or youtube_id not in YOUTUBE_ACCOUNTS_BY_ID:
+        log(f"  Skipping: no valid YouTube channel selected for this profile.")
+        return
+
     try:
         video = get_latest_tiktok_video(username)
     except Exception as e:
@@ -416,7 +551,7 @@ def check_account(username, history):
         log("  No videos found on this profile.")
         return
 
-    if history.get(username) == video["id"]:
+    if history.get(history_key) == video["id"]:
         log("  No new video since last check.")
         return
 
@@ -430,7 +565,7 @@ def check_account(username, history):
 
     title = video["title"][:95] + " #Shorts"
     description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
-    vid = upload_to_youtube(filepath, title, description)
+    vid = upload_to_youtube(filepath, title, description, youtube_id)
 
     try:
         if os.path.exists(filepath):
@@ -439,9 +574,9 @@ def check_account(username, history):
         pass
 
     if vid:
-        history[username] = video["id"]
+        history[history_key] = video["id"]
         save_history(history)
-        log(f"  Done: @{username} -> {video['id']} posted to YouTube.")
+        log(f"  Done: @{username} -> {video['id']} posted to {yt_label}.")
 
 
 def run_pipeline():
@@ -454,13 +589,16 @@ def run_pipeline():
 
     try:
         cfg = get_config()
-        usernames = cfg["usernames"]
-        if not usernames:
-            log("No accounts configured yet - add usernames on the dashboard.")
+        accounts = cfg["accounts"]
+        if not accounts:
+            log("No accounts configured yet - add accounts on the dashboard.")
+            return
+        if not YOUTUBE_ACCOUNTS:
+            log("No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON before running.")
             return
         history = load_history()
-        for username in usernames:
-            check_account(username, history)
+        for account in accounts:
+            check_account(account, history)
         log("Check cycle complete.")
     except Exception as e:
         log(f"Pipeline error: {e}")
@@ -472,7 +610,7 @@ def run_pipeline():
 def autopilot_loop():
     wait_seconds = STARTUP_WAIT_HOURS * 3600
     log(f"Startup window: waiting {STARTUP_WAIT_HOURS}h before the first check. "
-        f"Visit the dashboard to add TikTok usernames, or click 'Check All Now' to skip the wait.")
+        f"Visit the dashboard to add TikTok accounts, or click 'Check All Now' to skip the wait.")
     while True:
         next_run_at[0] = time.time() + wait_seconds
         trigger_event.wait(timeout=wait_seconds)
@@ -493,6 +631,14 @@ def main():
     else:
         log("WARNING: No TIKTOK_COOKIES_FILE set - requests are unauthenticated and "
             "much more likely to get blocked by TikTok.")
+
+    if YOUTUBE_ACCOUNTS:
+        labels = ", ".join(a["label"] for a in YOUTUBE_ACCOUNTS)
+        log(f"YouTube accounts loaded: {labels}")
+    else:
+        log("WARNING: No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON "
+            "(or the legacy YOUTUBE_REFRESH_TOKEN) or uploads will fail.")
+
     threading.Thread(target=start_server, daemon=True).start()
     threading.Thread(target=autopilot_loop, daemon=True).start()
     log("Bot started.")
