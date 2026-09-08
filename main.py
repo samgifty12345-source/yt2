@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 WORK_DIR = tempfile.gettempdir()
-HISTORY_FILE = "posted_history.json"  # {"tiktok::youtube_id": last_posted_video_id}
+HISTORY_FILE = "posted_history.json"  # {"tiktok::youtube_id": [posted_video_id, ...]}
 
 # Path to a cookies.txt file (relative paths resolve against the repo root
 # on Railway, e.g. "cookies.txt" if it's committed at the repo root).
@@ -35,6 +35,13 @@ MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", 
 
 # How often the bot checks each monitored account for a new video.
 POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "1"))
+
+# How many of a profile's most recent videos to look at each check cycle.
+# If a profile posts multiple videos between checks, the bot will still find
+# and post the ones that were missed, one per cycle, oldest of the missed
+# batch first - instead of only ever looking at the single newest video and
+# silently skipping anything that got buried under something newer.
+LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "5"))
 
 # How long to wait after boot before the first check, so you have a window
 # to open the dashboard and set usernames first if you didn't set
@@ -127,6 +134,17 @@ def load_history():
 def save_history(history):
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
+
+
+def get_posted_ids(history, history_key):
+    """Returns the list of already-posted video IDs for a profile, migrating
+    the old single-string format ({"key": "id"}) to a list transparently."""
+    val = history.get(history_key, [])
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, list):
+        return val
+    return []
 
 
 def get_google_creds(scopes, refresh_token):
@@ -240,9 +258,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <button type="submit">Save Accounts</button>
       </form>
       <div class="hint">
-        Every check cycle, the bot looks at each TikTok account's latest video. If it's new
-        (not already posted for that profile), it downloads it and uploads it to the YouTube
-        channel selected for that row, then remembers it so it's never posted twice.
+        Every check cycle, the bot looks at each TikTok account's last @@LOOKBACK@@ videos. Any
+        that aren't already posted for that profile get queued up, oldest first, one upload per
+        cycle, to the YouTube channel selected for that row - so nothing gets silently skipped
+        even if several videos land between checks.
         @@YT_HINT@@
       </div>
     </div>
@@ -312,7 +331,7 @@ def render_account_rows(accounts):
 
 def render_page():
     history = load_history()
-    done_count = len(history)
+    done_count = sum(len(get_posted_ids(history, k)) for k in history)
     with log_lock:
         log_text = "\n".join(pipeline_log[-40:])
     with pipeline_state_lock:
@@ -339,6 +358,7 @@ def render_page():
     html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
     html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
     html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
+    html = html.replace("@@LOOKBACK@@", str(LOOKBACK_COUNT))
     return html
 
 
@@ -406,15 +426,16 @@ def start_server():
 # TikTok checking + YouTube upload
 # ---------------------------------------------------------------------------
 
-def get_latest_tiktok_video(username):
-    """Returns {"id", "title", "url"} for the newest video on a TikTok profile,
-    or None if nothing was found. Raises on network/extraction failure."""
+def get_recent_tiktok_videos(username, limit=5):
+    """Returns up to `limit` most recent videos on a TikTok profile, newest
+    first, as a list of {"id", "title", "url"}. Empty list if none found.
+    Raises on network/extraction failure."""
     profile_url = f"https://www.tiktok.com/@{username}"
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
-        "playlistend": 1,
+        "playlistend": limit,
     }
     if TIKTOK_COOKIES_FILE:
         ydl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
@@ -424,14 +445,19 @@ def get_latest_tiktok_video(username):
 
     entries = info.get("entries") if info else None
     if not entries:
-        return None
-    latest = entries[0]
-    video_id = latest.get("id")
-    return {
-        "id": video_id,
-        "title": latest.get("title") or f"TikTok video {video_id}",
-        "url": latest.get("url") or f"https://www.tiktok.com/@{username}/video/{video_id}",
-    }
+        return []
+
+    videos = []
+    for entry in entries:
+        video_id = entry.get("id")
+        if not video_id:
+            continue
+        videos.append({
+            "id": video_id,
+            "title": entry.get("title") or f"TikTok video {video_id}",
+            "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{video_id}",
+        })
+    return videos
 
 
 def probe_duration_seconds(filepath):
@@ -542,18 +568,29 @@ def check_account(account, history):
         return
 
     try:
-        video = get_latest_tiktok_video(username)
+        videos = get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT)
     except Exception as e:
         log(f"  Failed to check TikTok: {e}")
         return
 
-    if video is None:
+    if not videos:
         log("  No videos found on this profile.")
         return
 
-    if history.get(history_key) == video["id"]:
+    posted_ids = get_posted_ids(history, history_key)
+
+    # videos is newest-first; find everything not yet posted, then take the
+    # OLDEST of those so a backlog gets posted in upload order, one per cycle.
+    unposted = [v for v in videos if v["id"] not in posted_ids]
+    if not unposted:
         log("  No new video since last check.")
         return
+
+    if len(unposted) > 1:
+        log(f"  {len(unposted)} unposted videos found within the last {len(videos)} - "
+            f"posting the oldest of them now, the rest next cycle(s).")
+
+    video = unposted[-1]
 
     log(f"  New video found ({video['id']}) - downloading...")
     filepath = os.path.join(WORK_DIR, f"{video['id']}.mp4")
@@ -574,7 +611,10 @@ def check_account(account, history):
         pass
 
     if vid:
-        history[history_key] = video["id"]
+        posted_ids.append(video["id"])
+        # Keep the most recent 50 posted IDs per profile - plenty of headroom
+        # over LOOKBACK_COUNT, avoids unbounded growth over months of use.
+        history[history_key] = posted_ids[-50:]
         save_history(history)
         log(f"  Done: @{username} -> {video['id']} posted to {yt_label}.")
 
