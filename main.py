@@ -590,15 +590,41 @@ def crop_to_landscape(input_path, output_path):
         "[0:v]scale=-2:1080,setsar=1[fg];"
         "[bg][fg]overlay=(W-w)/2:0,setsar=1"
     )
+    # -threads caps how many encoder threads libx264 spins up. Left unset,
+    # libx264 sizes itself off the number of CPUs it can see (34 threads in
+    # our logs), and each thread carries its own lookahead buffer - on a
+    # memory-limited container that can be enough to trip the OS's
+    # out-of-memory killer mid-encode, which shows up as the process dying
+    # with no real ffmpeg error message at all (just a SIGKILL). Capping
+    # threads keeps memory use predictable regardless of how many CPUs the
+    # container reports. Override with FFMPEG_THREADS if needed.
+    ffmpeg_threads = os.environ.get("FFMPEG_THREADS", "2")
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-filter_complex", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-threads", ffmpeg_threads,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", ffmpeg_threads,
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0 or not os.path.exists(output_path):
+        if result.returncode is not None and result.returncode < 0:
+            # Negative returncode from subprocess means the process was
+            # killed by a signal (POSIX: returncode == -signum), not that
+            # ffmpeg itself reported an error. -9 (SIGKILL) on a hosted
+            # container almost always means it ran out of memory.
+            signum = -result.returncode
+            reason = (
+                f"process was killed by signal {signum}"
+                + (" (SIGKILL - almost always an out-of-memory kill on the host container)"
+                   if signum == 9 else "")
+            )
+            raise RuntimeError(
+                f"ffmpeg crop failed - {reason}. Try lowering FFMPEG_THREADS "
+                f"(currently {ffmpeg_threads}) or check the container's memory limit.\n"
+                f"Last ffmpeg output before it died:\n{_clean_ffmpeg_stderr(result.stderr)}"
+            )
         raise RuntimeError(
             f"ffmpeg crop failed (exit code {result.returncode}):\n"
             f"{_clean_ffmpeg_stderr(result.stderr)}"
