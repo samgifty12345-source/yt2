@@ -540,8 +540,14 @@ def crop_to_landscape(input_path, output_path):
     frame (heads, captions, hands) and only keeps a thin middle strip.
     """
     vf = (
-        "[0:v]scale=1920:1080,boxblur=20:5[bg];"
-        "[0:v]scale=-1:1080[fg];"
+        # Downscale before blurring - blurring is expensive per-pixel, and a
+        # blurred background loses detail anyway, so blur at a fraction of
+        # the resolution then scale back up. ~4x less work than blurring at
+        # full 1920x1080 for a visually identical result.
+        "[0:v]scale=480:270,boxblur=10:2,scale=1920:1080[bg];"
+        # -2 (not -1) forces an even auto-computed width, which libx264
+        # requires - odd dimensions can fail encoding outright.
+        "[0:v]scale=-2:1080[fg];"
         "[bg][fg]overlay=(W-w)/2:0"
     )
     cmd = [
@@ -551,9 +557,9 @@ def crop_to_landscape(input_path, output_path):
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError(f"ffmpeg crop failed: {result.stderr[-800:]}")
+        raise RuntimeError(f"ffmpeg crop failed: {result.stderr[-2000:]}")
     log(f"  Cropped to landscape ({os.path.getsize(output_path) / 1_000_000:.1f} MB)")
 
 
