@@ -15,11 +15,12 @@ from googleapiclient.http import MediaFileUpload
 
 WORK_DIR = tempfile.gettempdir()
 HISTORY_FILE = "posted_history.json"
+UPLOAD_LIMIT_FILE = "upload_limits.json"  # Track when channels hit the limit
 
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
 MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))
 MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", "1.0"))
-POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "8"))
+POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "5"))
 LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "5"))
 STARTUP_WAIT_HOURS = float(os.environ.get("STARTUP_WAIT_HOURS", "0.05"))
 
@@ -99,6 +100,40 @@ def load_history():
 def save_history(history):
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
+
+
+def load_upload_limits():
+    """Load when each YouTube channel hit upload limit"""
+    if os.path.exists(UPLOAD_LIMIT_FILE):
+        with open(UPLOAD_LIMIT_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_upload_limits(limits):
+    """Save upload limit timestamps"""
+    with open(UPLOAD_LIMIT_FILE, "w") as f:
+        json.dump(limits, f, indent=2)
+
+
+def is_channel_limited(youtube_account_id, limits):
+    """Check if channel is currently in 24-hour cooldown"""
+    if youtube_account_id not in limits:
+        return False
+    
+    limit_time = limits[youtube_account_id]
+    current_time = time.time()
+    hours_passed = (current_time - limit_time) / 3600
+    
+    if hours_passed < 24:
+        remaining = 24 - hours_passed
+        log(f"  ⏸️  UPLOAD LIMIT ACTIVE - Channel paused for {remaining:.1f} more hours")
+        return True
+    else:
+        # 24 hours passed, reset the limit
+        del limits[youtube_account_id]
+        save_upload_limits(limits)
+        return False
 
 
 def get_posted_ids(history, history_key):
@@ -471,7 +506,7 @@ def download_tiktok_video(video_url, filepath):
     log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
 
 
-def upload_to_youtube(file_path, title, description, youtube_account_id):
+def upload_to_youtube(file_path, title, description, youtube_account_id, limits):
     account = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_account_id)
     if not account:
         log(f"  Upload failed: no YouTube account configured for id '{youtube_account_id}'")
@@ -487,18 +522,14 @@ def upload_to_youtube(file_path, title, description, youtube_account_id):
         return None
 
     log(f"  Uploading to YouTube ({account['label']})...")
-    log(f"  [DEBUG] Using client_id: {client_id[:20]}...")
     try:
-        log(f"  [DEBUG] Creating credentials object...")
         creds = get_google_creds(
             ["https://www.googleapis.com/auth/youtube.upload"],
             account["refresh_token"],
             client_id,
             client_secret,
         )
-        log(f"  [DEBUG] Refreshing access token...")
         creds.refresh(Request())
-        log(f"  [DEBUG] Building YouTube API client...")
         youtube = build("youtube", "v3", credentials=creds)
         
         body = {
@@ -506,7 +537,6 @@ def upload_to_youtube(file_path, title, description, youtube_account_id):
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
         }
         media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
-        log(f"  [DEBUG] Inserting video to YouTube...")
         req = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
         response = None
         while response is None:
@@ -516,20 +546,30 @@ def upload_to_youtube(file_path, title, description, youtube_account_id):
         return vid
     except Exception as e:
         import traceback
-        log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
-        log(f"  [FULL TRACEBACK]")
-        for line in traceback.format_exc().split('\n'):
-            log(f"  {line}")
+        error_str = str(e)
+        
+        # Check if it's upload limit error
+        if "uploadLimitExceeded" in error_str or "exceeded the number of videos" in error_str:
+            log(f"  ⏸️  UPLOAD LIMIT HIT! Setting 24-hour cooldown for this channel")
+            limits[youtube_account_id] = time.time()
+            save_upload_limits(limits)
+        else:
+            log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
+        
         return None
 
 
-def check_account(account, history):
+def check_account(account, history, limits):
     username = account["tiktok"]
     youtube_id = account.get("youtube") or (YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else "")
     yt_label = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_id, {}).get("label", youtube_id or "no channel set")
     history_key = f"{username}::{youtube_id}"
 
     log(f"Checking @{username} (-> {yt_label})...")
+
+    # Check if channel is in cooldown
+    if is_channel_limited(youtube_id, limits):
+        return
 
     if not youtube_id or youtube_id not in YOUTUBE_ACCOUNTS_BY_ID:
         log(f"  Skipping: no valid YouTube channel selected for this profile.")
@@ -568,7 +608,7 @@ def check_account(account, history):
 
     title = video["title"][:95] + " #Shorts"
     description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
-    vid = upload_to_youtube(filepath, title, description, youtube_id)
+    vid = upload_to_youtube(filepath, title, description, youtube_id, limits)
 
     try:
         if os.path.exists(filepath):
@@ -601,8 +641,9 @@ def run_pipeline():
             log("No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON before running.")
             return
         history = load_history()
+        limits = load_upload_limits()
         for account in accounts:
-            check_account(account, history)
+            check_account(account, history, limits)
         log("Check cycle complete.")
     except Exception as e:
         log(f"Pipeline error: {e}")
@@ -641,7 +682,6 @@ def main():
             has_client = bool(acc.get("client_id") and acc.get("client_secret"))
             client_note = "OK" if has_client else "MISSING client_id/client_secret!"
             log(f"YouTube account loaded: {acc['label']} (id={acc['id']}) - OAuth client: {client_note}")
-            log(f"  [DEBUG] Account {acc['id']}: client_id={acc.get('client_id', 'NOT SET')[:20]}...")
     else:
         log("WARNING: No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON "
             "(or the legacy YOUTUBE_REFRESH_TOKEN) or uploads will fail.")
