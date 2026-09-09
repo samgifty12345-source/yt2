@@ -19,7 +19,7 @@ HISTORY_FILE = "posted_history.json"
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
 MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))
 MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", "1.0"))
-POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "1"))
+POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "8"))
 LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "5"))
 STARTUP_WAIT_HOURS = float(os.environ.get("STARTUP_WAIT_HOURS", "0.05"))
 
