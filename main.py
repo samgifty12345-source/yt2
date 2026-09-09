@@ -28,22 +28,39 @@ _seed_usernames = [
     u.strip().lstrip("@") for u in os.environ.get("TIKTOK_USERNAMES", "").split(",") if u.strip()
 ]
 
-pipeline_log = ["TikTok -> YouTube bot ready. Waiting for the startup window or a manual trigger."]
+# ---------------------------------------------------------------------------
+# Two logging tiers:
+#   log()    -> full, verbose, technical detail. Goes to stdout only, which
+#               is what shows up in Railway's deployment logs. Not shown on
+#               the website.
+#   status() -> short, human-readable milestones for the website's Activity
+#               feed (found video / cropping / uploading / done, with links).
+# ---------------------------------------------------------------------------
 log_lock = threading.Lock()
+status_lock = threading.Lock()
+status_feed = []  # what the website shows
+
+
+def log(msg):
+    """Verbose/technical log line. Printed to stdout for Railway logs only."""
+    print(msg, flush=True)
+
+
+def status(msg):
+    """Short milestone for the website's Activity feed. Also echoed to stdout
+    so it appears in Railway logs too, just prefixed for clarity."""
+    print(f"[status] {msg}", flush=True)
+    with status_lock:
+        status_feed.append(msg)
+        if len(status_feed) > 60:
+            status_feed.pop(0)
+
 
 pipeline_state_lock = threading.Lock()
 pipeline_running = False
 
 trigger_event = threading.Event()
 next_run_at = [time.time() + STARTUP_WAIT_HOURS * 3600]
-
-
-def log(msg):
-    print(msg, flush=True)
-    with log_lock:
-        pipeline_log.append(msg)
-        if len(pipeline_log) > 100:
-            pipeline_log.pop(0)
 
 
 def load_youtube_accounts():
@@ -195,9 +212,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
   label:first-of-type { margin-top: 0; }
-  textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit; resize: vertical; }
-  textarea:focus { outline: none; border-color: var(--accent-2); }
   input[type=text], select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
     padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
   input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
@@ -211,9 +225,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; letter-spacing: 0.01em; }
   button:hover { filter: brightness(1.08); }
   button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
-  .log { background: #08080d; border: 1px solid var(--border); border-radius: 10px; padding: 14px;
-    font-size: 12px; color: #8fe3a8; font-family: "SF Mono", Menlo, Consolas, monospace;
-    max-height: 360px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+  .feed { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow-y: auto; }
+  .feed-item { background: #08080d; border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; line-height: 1.5; }
+  .feed-item a { color: var(--accent-2); text-decoration: none; }
+  .feed-item a:hover { text-decoration: underline; }
+  .feed-empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
   .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
 </style>
@@ -237,11 +254,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <div class="badge @@YT_WARN_CLASS@@">YouTube channels <b>@@YT_COUNT@@</b></div>
         <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
       </div>
-      <div class="log">@@LOG_CONTENT@@</div>
+      <h2 style="margin-top:20px;">Activity</h2>
+      <div class="feed">@@FEED_CONTENT@@</div>
       <form method="POST" action="/trigger">
         <button type="submit">Check All Now</button>
       </form>
-      <div class="hint">Checks every monitored account immediately instead of waiting for the next scheduled check.</div>
+      <div class="hint">Checks every monitored account immediately instead of waiting for the next scheduled check. Full technical logs are in your Railway deployment logs, not here.</div>
     </div>
 
     <div class="card">
@@ -342,11 +360,18 @@ def render_account_rows(accounts):
     return "\n".join(rows), len(rows_source)
 
 
+def render_feed_html():
+    with status_lock:
+        items = list(status_feed[-25:])
+    if not items:
+        return '<div class="feed-empty">Nothing yet - click "Check All Now" or wait for the next scheduled check.</div>'
+    # newest first
+    return "\n".join(f'<div class="feed-item">{item}</div>' for item in reversed(items))
+
+
 def render_page():
     history = load_history()
     done_count = sum(len(get_posted_ids(history, k)) for k in history)
-    with log_lock:
-        log_text = "\n".join(pipeline_log[-40:])
     with pipeline_state_lock:
         running = pipeline_running
 
@@ -365,7 +390,7 @@ def render_page():
     html = html.replace("@@YT_COUNT@@", str(len(YOUTUBE_ACCOUNTS)))
     html = html.replace("@@YT_WARN_CLASS@@", "warn" if not YOUTUBE_ACCOUNTS else "")
     html = html.replace("@@YT_HINT@@", yt_hint)
-    html = html.replace("@@LOG_CONTENT@@", log_text)
+    html = html.replace("@@FEED_CONTENT@@", render_feed_html())
     html = html.replace("@@ACCOUNT_ROWS@@", rows_html)
     html = html.replace("@@ROW_COUNT@@", str(row_count))
     html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
@@ -423,6 +448,7 @@ class Handler(BaseHTTPRequestHandler):
             log(f"Accounts updated -> {summary if accounts else '(none)'}")
         elif self.path == "/trigger":
             log("Manual trigger received - checking all accounts now.")
+            status("🔁 Manual check triggered.")
             trigger_event.set()
 
         self.send_response(303)
@@ -531,6 +557,18 @@ def download_tiktok_video(video_url, filepath):
     log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
 
 
+def _clean_ffmpeg_stderr(stderr, max_lines=40):
+    """Strip out the high-volume, low-signal noise (progress ticks, codec
+    banner) from ffmpeg's stderr so the real error line is actually visible,
+    instead of getting pushed out by a character-count tail truncation."""
+    noisy_prefixes = ("frame=", "size=")
+    lines = [
+        l for l in stderr.splitlines()
+        if l.strip() and not l.strip().startswith(noisy_prefixes)
+    ]
+    return "\n".join(lines[-max_lines:]) if lines else stderr[-2000:]
+
+
 def crop_to_landscape(input_path, output_path):
     """
     Convert a vertical (9:16) video to landscape (16:9) using a blurred
@@ -538,17 +576,19 @@ def crop_to_landscape(input_path, output_path):
     zoomed copy of itself filling the left/right bars. Nothing is cropped
     out - unlike a plain center-crop, which cuts off the top/bottom of the
     frame (heads, captions, hands) and only keeps a thin middle strip.
+
+    setsar=1 is applied after every scale/overlay stage. Without it, the
+    original vertical clip's sample-aspect-ratio metadata can survive into
+    the background and foreground branches with different values, which
+    confuses `overlay` and/or leaves the final file's display-aspect-ratio
+    tagged incorrectly (e.g. still reporting as portrait even though the
+    pixel dimensions are 1920x1080) - this was the likely cause of crops
+    silently failing or producing a mis-tagged "landscape" file.
     """
     vf = (
-        # Downscale before blurring - blurring is expensive per-pixel, and a
-        # blurred background loses detail anyway, so blur at a fraction of
-        # the resolution then scale back up. ~4x less work than blurring at
-        # full 1920x1080 for a visually identical result.
-        "[0:v]scale=480:270,boxblur=10:2,scale=1920:1080[bg];"
-        # -2 (not -1) forces an even auto-computed width, which libx264
-        # requires - odd dimensions can fail encoding outright.
-        "[0:v]scale=-2:1080[fg];"
-        "[bg][fg]overlay=(W-w)/2:0"
+        "[0:v]scale=480:270,boxblur=10:2,scale=1920:1080,setsar=1[bg];"
+        "[0:v]scale=-2:1080,setsar=1[fg];"
+        "[bg][fg]overlay=(W-w)/2:0,setsar=1"
     )
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
@@ -559,7 +599,10 @@ def crop_to_landscape(input_path, output_path):
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError(f"ffmpeg crop failed: {result.stderr[-2000:]}")
+        raise RuntimeError(
+            f"ffmpeg crop failed (exit code {result.returncode}):\n"
+            f"{_clean_ffmpeg_stderr(result.stderr)}"
+        )
     log(f"  Cropped to landscape ({os.path.getsize(output_path) / 1_000_000:.1f} MB)")
 
 
@@ -597,7 +640,7 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
         req = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
         response = None
         while response is None:
-            status, response = req.next_chunk()
+            status_chunk, response = req.next_chunk()
         vid = response.get("id")
         log(f"  Live -> https://youtube.com/watch?v={vid}")
         return vid
@@ -607,10 +650,12 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
         # Check if it's upload limit error
         if "uploadLimitExceeded" in error_str or "exceeded the number of videos" in error_str:
             log(f"  ⏸️  UPLOAD LIMIT HIT! Setting 24-hour cooldown for this channel")
+            status(f"⏸️ YouTube upload limit hit on <b>{esc(account['label'])}</b> - paused 24h.")
             limits[youtube_account_id] = time.time()
             save_upload_limits(limits)
         else:
             log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
+            status(f"❌ Upload to <b>{esc(account['label'])}</b> failed: {esc(type(e).__name__)}")
 
         return None
 
@@ -636,6 +681,7 @@ def check_account(account, history, limits):
         videos = get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT)
     except Exception as e:
         log(f"  Failed to check TikTok: {e}")
+        status(f"❌ Couldn't check @{esc(username)} on TikTok: {esc(type(e).__name__)}")
         return
 
     if not videos:
@@ -654,24 +700,30 @@ def check_account(account, history, limits):
             f"posting the oldest of them now, the rest next cycle(s).")
 
     video = unposted[-1]
+    tiktok_link = f'<a href="{esc(video["url"])}" target="_blank">TikTok source</a>'
 
     log(f"  New video found ({video['id']}) - downloading...")
+    status(f"📥 Found new video from @{esc(username)} - {tiktok_link}")
+
     filepath = os.path.join(WORK_DIR, f"{video['id']}.mp4")
     try:
         download_tiktok_video(video["url"], filepath)
     except Exception as e:
         log(f"  Download failed: {e}")
+        status(f"❌ Download failed for @{esc(username)}'s video: {esc(type(e).__name__)}")
         return
 
     upload_path = filepath
     landscape_path = None
     if video_format == "landscape":
+        status(f"🎬 Cropping @{esc(username)}'s video to landscape...")
         landscape_path = os.path.join(WORK_DIR, f"{video['id']}_landscape.mp4")
         try:
             crop_to_landscape(filepath, landscape_path)
             upload_path = landscape_path
         except Exception as e:
             log(f"  Crop failed, falling back to vertical upload: {e}")
+            status(f"⚠️ Crop failed - posting @{esc(username)}'s video as vertical instead.")
             upload_path = filepath
             landscape_path = None
 
@@ -680,6 +732,8 @@ def check_account(account, history, limits):
     else:
         title = video["title"][:95] + " #Shorts"
     description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
+
+    status(f"⬆️ Uploading to YouTube ({esc(yt_label)})...")
     vid = upload_to_youtube(upload_path, title, description, youtube_id, limits)
 
     for p in (filepath, landscape_path):
@@ -694,6 +748,8 @@ def check_account(account, history, limits):
         history[history_key] = posted_ids[-50:]
         save_history(history)
         log(f"  Done: @{username} -> {video['id']} posted to {yt_label}.")
+        yt_link = f'<a href="https://youtube.com/watch?v={esc(vid)}" target="_blank">https://youtube.com/watch?v={esc(vid)}</a>'
+        status(f"✅ Done! @{esc(username)} -> {esc(yt_label)}: {yt_link} ({tiktok_link})")
 
 
 def run_pipeline():
