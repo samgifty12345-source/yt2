@@ -80,8 +80,10 @@ YOUTUBE_ACCOUNTS_BY_ID = {a["id"]: a for a in YOUTUBE_ACCOUNTS}
 
 config_lock = threading.Lock()
 _default_youtube_id = YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else ""
+# "format" per account row: "shorts" (default, vertical as-is) or "landscape"
+# (blurred-pillarbox crop to 16:9, posted as a normal long-form video, no #Shorts tag)
 CONFIG = {
-    "accounts": [{"tiktok": u, "youtube": _default_youtube_id} for u in _seed_usernames]
+    "accounts": [{"tiktok": u, "youtube": _default_youtube_id, "format": "shorts"} for u in _seed_usernames]
 }
 
 
@@ -120,11 +122,11 @@ def is_channel_limited(youtube_account_id, limits):
     """Check if channel is currently in 24-hour cooldown"""
     if youtube_account_id not in limits:
         return False
-    
+
     limit_time = limits[youtube_account_id]
     current_time = time.time()
     hours_passed = (current_time - limit_time) / 3600
-    
+
     if hours_passed < 24:
         remaining = 24 - hours_passed
         log(f"  ⏸️  UPLOAD LIMIT ACTIVE - Channel paused for {remaining:.1f} more hours")
@@ -200,8 +202,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
   input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
   .account-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-  .account-row input[type=text] { flex: 1; }
-  .account-row select { flex: 1; }
+  .account-row input[type=text] { flex: 1; min-width: 0; }
+  .account-row select { flex: 1; min-width: 0; }
+  .account-row select.fmt { flex: 0 0 118px; }
   .account-row button { width: auto; margin-top: 0; padding: 8px 12px; }
   button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
     color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
@@ -244,7 +247,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="card">
       <h2>Monitored Accounts</h2>
       <form method="POST" action="/configure">
-        <label>Each row is one profile: a TikTok account paired with the YouTube channel it posts to.</label>
+        <label>Each row: TikTok account, the YouTube channel it posts to, and the output format.</label>
         <div id="accountRows">
 @@ACCOUNT_ROWS@@
         </div>
@@ -256,6 +259,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         that aren't already posted for that profile get queued up, oldest first, one upload per
         cycle, to the YouTube channel selected for that row - so nothing gets silently skipped
         even if several videos land between checks.
+        <br><b>Shorts</b> posts the vertical video as-is with a #Shorts tag.
+        <b>Landscape</b> crops it to 16:9 (blurred pillarbox, nothing is cut off) and posts it as
+        a normal long-form video with no #Shorts tag.
         @@YT_HINT@@
       </div>
     </div>
@@ -272,6 +278,10 @@ function addRow() {
   div.innerHTML = `
     <input type="text" name="tiktok_${rowIndex}" placeholder="tiktok username">
     <select name="youtube_${rowIndex}">@@YOUTUBE_OPTIONS_JS@@</select>
+    <select name="format_${rowIndex}" class="fmt">
+      <option value="shorts">Shorts</option>
+      <option value="landscape">Landscape</option>
+    </select>
     <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>
   `;
   document.getElementById('accountRows').appendChild(div);
@@ -309,14 +319,23 @@ def youtube_options_html(selected=""):
     return "\n".join(opts)
 
 
+def format_options_html(selected="shorts"):
+    opts = []
+    for value, label in (("shorts", "Shorts"), ("landscape", "Landscape")):
+        sel = " selected" if value == selected else ""
+        opts.append(f'<option value="{value}"{sel}>{label}</option>')
+    return "\n".join(opts)
+
+
 def render_account_rows(accounts):
-    rows_source = accounts if accounts else [{"tiktok": "", "youtube": ""}]
+    rows_source = accounts if accounts else [{"tiktok": "", "youtube": "", "format": "shorts"}]
     rows = []
     for i, acc in enumerate(rows_source):
         rows.append(
             f'<div class="account-row">\n'
             f'  <input type="text" name="tiktok_{i}" value="{esc(acc.get("tiktok", ""))}" placeholder="tiktok username">\n'
             f'  <select name="youtube_{i}">{youtube_options_html(acc.get("youtube", ""))}</select>\n'
+            f'  <select name="format_{i}" class="fmt">{format_options_html(acc.get("format", "shorts"))}</select>\n'
             f'  <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>\n'
             f'</div>'
         )
@@ -368,11 +387,14 @@ def parse_accounts_from_form(fields_multi):
     for i in sorted(indices):
         tiktok = fields_multi.get(f"tiktok_{i}", [""])[0].strip().lstrip("@")
         youtube = fields_multi.get(f"youtube_{i}", [""])[0].strip()
+        fmt = fields_multi.get(f"format_{i}", ["shorts"])[0].strip()
+        if fmt not in ("shorts", "landscape"):
+            fmt = "shorts"
         if not tiktok:
             continue
         if not youtube and YOUTUBE_ACCOUNTS:
             youtube = YOUTUBE_ACCOUNTS[0]["id"]
-        accounts.append({"tiktok": tiktok, "youtube": youtube})
+        accounts.append({"tiktok": tiktok, "youtube": youtube, "format": fmt})
     return accounts
 
 
@@ -394,7 +416,10 @@ class Handler(BaseHTTPRequestHandler):
             accounts = parse_accounts_from_form(fields_multi)
             with config_lock:
                 CONFIG["accounts"] = accounts
-            summary = ", ".join(f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])}" for a in accounts)
+            summary = ", ".join(
+                f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])} ({a['format']})"
+                for a in accounts
+            )
             log(f"Accounts updated -> {summary if accounts else '(none)'}")
         elif self.path == "/trigger":
             log("Manual trigger received - checking all accounts now.")
@@ -506,6 +531,32 @@ def download_tiktok_video(video_url, filepath):
     log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
 
 
+def crop_to_landscape(input_path, output_path):
+    """
+    Convert a vertical (9:16) video to landscape (16:9) using a blurred
+    pillarbox: the full original frame is kept, centered, with a blurred
+    zoomed copy of itself filling the left/right bars. Nothing is cropped
+    out - unlike a plain center-crop, which cuts off the top/bottom of the
+    frame (heads, captions, hands) and only keeps a thin middle strip.
+    """
+    vf = (
+        "[0:v]scale=1920:1080,boxblur=20:5[bg];"
+        "[0:v]scale=-1:1080[fg];"
+        "[bg][fg]overlay=(W-w)/2:0"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0 or not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg crop failed: {result.stderr[-800:]}")
+    log(f"  Cropped to landscape ({os.path.getsize(output_path) / 1_000_000:.1f} MB)")
+
+
 def upload_to_youtube(file_path, title, description, youtube_account_id, limits):
     account = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_account_id)
     if not account:
@@ -531,7 +582,7 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
         )
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
-        
+
         body = {
             "snippet": {"title": title[:100], "description": description, "categoryId": "24"},
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
@@ -545,9 +596,8 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
         log(f"  Live -> https://youtube.com/watch?v={vid}")
         return vid
     except Exception as e:
-        import traceback
         error_str = str(e)
-        
+
         # Check if it's upload limit error
         if "uploadLimitExceeded" in error_str or "exceeded the number of videos" in error_str:
             log(f"  ⏸️  UPLOAD LIMIT HIT! Setting 24-hour cooldown for this channel")
@@ -555,17 +605,18 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
             save_upload_limits(limits)
         else:
             log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
-        
+
         return None
 
 
 def check_account(account, history, limits):
     username = account["tiktok"]
     youtube_id = account.get("youtube") or (YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else "")
+    video_format = account.get("format", "shorts")
     yt_label = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_id, {}).get("label", youtube_id or "no channel set")
     history_key = f"{username}::{youtube_id}"
 
-    log(f"Checking @{username} (-> {yt_label})...")
+    log(f"Checking @{username} (-> {yt_label}, {video_format})...")
 
     # Check if channel is in cooldown
     if is_channel_limited(youtube_id, limits):
@@ -606,15 +657,31 @@ def check_account(account, history, limits):
         log(f"  Download failed: {e}")
         return
 
-    title = video["title"][:95] + " #Shorts"
-    description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
-    vid = upload_to_youtube(filepath, title, description, youtube_id, limits)
+    upload_path = filepath
+    landscape_path = None
+    if video_format == "landscape":
+        landscape_path = os.path.join(WORK_DIR, f"{video['id']}_landscape.mp4")
+        try:
+            crop_to_landscape(filepath, landscape_path)
+            upload_path = landscape_path
+        except Exception as e:
+            log(f"  Crop failed, falling back to vertical upload: {e}")
+            upload_path = filepath
+            landscape_path = None
 
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-    except Exception:
-        pass
+    if video_format == "landscape" and upload_path == landscape_path:
+        title = video["title"][:100]
+    else:
+        title = video["title"][:95] + " #Shorts"
+    description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
+    vid = upload_to_youtube(upload_path, title, description, youtube_id, limits)
+
+    for p in (filepath, landscape_path):
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
     if vid:
         posted_ids.append(video["id"])
