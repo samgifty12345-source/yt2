@@ -33,8 +33,7 @@ CANVAS_H = int(os.environ.get("CANVAS_H", "1920"))
 
 # --- Timeline knobs -----------------------------------------------------
 # How long the intro plays big/bottom-anchored before shrinking to the corner.
-# If the intro clip is shorter than this, it's clamped down to the intro's own length
-# and there's no separate corner-shrink phase.
+# If the intro clip is shorter than this, it's clamped down to the intro's own length.
 HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
 HOOK_HEIGHT_PCT = float(os.environ.get("HOOK_HEIGHT_PCT", "0.5"))   # fraction of canvas height
 
@@ -130,7 +129,7 @@ def pick_random_pool_file(directory):
 
 
 # ---------------------------------------------------------------------------
-# TikTok fetching for the base-clip pool only
+# TikTok fetching for the base-clip pool
 # ---------------------------------------------------------------------------
 
 def get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT):
@@ -210,7 +209,7 @@ def pick_unused_base_video(username):
 
 def generate_caption_and_hashtags(base_title):
     if not GROQ_API_KEY:
-        return "New one dropped \U0001F440", "#fyi #factcheck #ai"
+        return "New one dropped 👀", "#fyi #factcheck #ai"
     prompt = f"""You write short, punchy captions for a UGC-style reaction video on TikTok/Instagram.
 The reaction is a "let's fact-check this claim" format. The base clip being reacted to is
 titled/described: "{base_title}"
@@ -235,7 +234,7 @@ Return ONLY valid JSON, no markdown fences:
         return data.get("caption", ""), data.get("hashtags", "")
     except Exception as e:
         log(f"  Caption generation failed, using fallback: {e}")
-        return "New one dropped \U0001F440", "#fyi #factcheck #ai"
+        return "New one dropped 👀", "#fyi #factcheck #ai"
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +249,7 @@ def build_reaction_ad(base_path, base_dur, intro_path, intro_dur, outro_path, ou
       Phase 2 (hook -> intro_dur):      intro clip shrunk to a small box, vertically centered,
                                          right side. Background is still the same frozen base
                                          frame (base has not started playing yet). Skipped
-                                         entirely if the intro clip is too short to have a
-                                         separate shrink phase.
+                                         if intro is too short.
       Phase 3 (intro_dur -> +base_dur): base video UNPAUSES and plays in full, fullscreen.
       Phase 4 (-> +outro_dur):          outro clip plays in full, fullscreen.
     """
@@ -265,8 +263,8 @@ def build_reaction_ad(base_path, base_dur, intro_path, intro_dur, outro_path, ou
 
     parts = []
 
-    # Frozen base frame for phase 1 (and phase 2, if it exists) - grab ~2 frames from the
-    # very start of the base video and loop the first one to fill the needed duration.
+    # Frozen base frame for phase 1 (and phase 2, if it exists)
+    # Grab the first frame and loop it to fill the duration.
     parts.append(
         f"[0:v]trim=0:0.08,setpts=PTS-STARTPTS,{scale_crop},loop=loop=-1:size=1,"
         f"trim=duration={hook},setpts=PTS-STARTPTS[bg_p1]"
@@ -336,7 +334,7 @@ def run_pipeline():
     global pipeline_running
     with pipeline_state_lock:
         if pipeline_running:
-            status("\u23F3 Already generating one - hang tight.")
+            status("⏳ Already generating one - hang tight.")
             return
         pipeline_running = True
 
@@ -345,41 +343,41 @@ def run_pipeline():
         cfg = get_config()
         base_username = cfg["base_username"]
         if not base_username:
-            status("\u274C Set the base-clips TikTok handle before generating.")
+            status("❌ Set the base-clips TikTok handle before generating.")
             return
 
         intro_path = pick_random_pool_file(INTRO_DIR)
         if not intro_path:
-            status("\u274C No intro clips uploaded yet - add at least one on the dashboard.")
+            status("❌ No intro clips uploaded yet - add at least one on the dashboard.")
             return
         outro_path = pick_random_pool_file(OUTRO_DIR)
         if not outro_path:
-            status("\u274C No outro clips uploaded yet - add at least one on the dashboard.")
+            status("❌ No outro clips uploaded yet - add at least one on the dashboard.")
             return
 
-        status(f"\U0001F50D Picking a fresh base clip from @{base_username}...")
+        status(f"🔍 Picking a fresh base clip from @{base_username}...")
         base_video = pick_unused_base_video(base_username)
         if not base_video:
-            status(f"\u274C No unused base clips left from @{base_username} in the last {LOOKBACK_COUNT} posts.")
+            status(f"❌ No unused base clips left from @{base_username} in the last {LOOKBACK_COUNT} posts.")
             return
 
-        status(f"\U0001F4E5 Downloading base clip ({base_video['id']})...")
+        status(f"📥 Downloading base clip ({base_video['id']})...")
         base_path = os.path.join(WORK_DIR, f"base_{base_video['id']}.mp4")
         base_dur = download_tiktok_video(base_video["url"], base_path)
 
         intro_dur = probe_duration_seconds(intro_path)
         outro_dur = probe_duration_seconds(outro_path)
         if not intro_dur or not outro_dur:
-            status("\u274C Couldn't read one of the uploaded clips - try re-uploading it.")
+            status("❌ Couldn't read one of the uploaded clips - try re-uploading it.")
             return
 
-        status(f"\U0001F3AC Compositing intro ({os.path.basename(intro_path)}) -> base -> "
+        status(f"🎬 Compositing intro ({os.path.basename(intro_path)}) -> base -> "
                f"outro ({os.path.basename(outro_path)})...")
         output_name = f"ad_{base_video['id']}_{int(time.time())}.mp4"
         output_path = os.path.join(PREVIEW_DIR, output_name)
         build_reaction_ad(base_path, base_dur, intro_path, intro_dur, outro_path, output_path)
 
-        status("\u270D\uFE0F Writing caption + hashtags...")
+        status("✍️ Writing caption + hashtags...")
         caption, hashtags = generate_caption_and_hashtags(base_video["title"])
 
         mark_base_used(base_video["id"])
@@ -394,11 +392,11 @@ def run_pipeline():
             "intro_file": os.path.basename(intro_path),
             "outro_file": os.path.basename(outro_path),
         })
-        status("\u2705 Ready to review - new preview added below.")
+        status("✅ Ready to review - new preview added below.")
 
     except Exception as e:
         log(f"Pipeline error: {e}")
-        status(f"\u274C Generation failed: {type(e).__name__}: {e}")
+        status(f"❌ Generation failed: {type(e).__name__}: {e}")
     finally:
         try:
             if base_path and os.path.exists(base_path):
@@ -410,7 +408,7 @@ def run_pipeline():
 
 
 # ---------------------------------------------------------------------------
-# Multipart parsing (no external deps; cgi is removed in 3.13+)
+# Multipart parsing
 # ---------------------------------------------------------------------------
 
 def parse_multipart(handler):
@@ -425,7 +423,7 @@ def parse_multipart(handler):
     length = int(handler.headers.get("Content-Length", 0))
     raw = handler.rfile.read(length) if length else b""
 
-    fields, files = {}, []  # files: list of (field_name, filename, data) - supports multiple same-name files
+    fields, files = {}, []
     parts = raw.split(boundary_bytes)
     for part in parts:
         part = part.strip(b"\r\n")
@@ -504,7 +502,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
   .badge b { color: var(--text); }
   .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
-  .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
   label:first-of-type { margin-top: 0; }
   input[type=text], input[type=file] {
@@ -545,7 +542,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="logo">UGC</div>
     <div>
       <h1>UGC Reaction Ad Bot</h1>
-      <div class="sub">Your intro -&gt; base clip -&gt; your outro, auto-composited for review</div>
+      <div class="sub">Your intro + base clip + your outro, auto-composited for review</div>
     </div>
   </header>
 
@@ -591,7 +588,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <input type="file" name="clip" accept="video/*">
         <button type="submit" class="secondary">Add Intro</button>
       </form>
-      <div class="hint">Picked at random each generation - can repeat. Add as many as you like.</div>
+      <div class="hint">First 3s plays big on bottom. Shrinks to corner during base video. Add as many as you like - one is picked at random each generation.</div>
     </div>
 
     <div class="card">
@@ -605,7 +602,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <input type="file" name="clip" accept="video/*">
         <button type="submit" class="secondary">Add Outro</button>
       </form>
-      <div class="hint">Picked at random each generation - can repeat. Add as many as you like.</div>
+      <div class="hint">Plays fullscreen after base video. Add as many as you like - one is picked at random each generation.</div>
     </div>
   </div>
 
@@ -614,7 +611,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 @@PREVIEW_CARDS@@
   </div>
 
-  <footer>Timeline: your intro (hook @@HOOK_SECONDS@@s then corner) over a paused base frame &rarr; base unpauses &rarr; your outro</footer>
+  <footer>Timeline: intro (@@HOOK_SECONDS@@s big, then corner) over frozen base frame → base unpauses → outro</footer>
 </div>
 </body>
 </html>"""
