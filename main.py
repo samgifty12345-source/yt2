@@ -16,6 +16,8 @@ os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 USED_VIDEOS_FILE = "used_videos.json"       # {"base": [id,id,...], "reaction": [id,id,...]}
 PREVIEWS_FILE = "previews.json"             # list of finished preview metadata, newest first
+INTRO_FILE = os.path.join(PREVIEW_DIR, "intro.mp4")     # optional intro video
+OUTRO_FILE = os.path.join(PREVIEW_DIR, "outro.mp4")     # optional outro video
 
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -109,6 +111,14 @@ def add_preview(entry):
     previews.insert(0, entry)
     previews = previews[:30]  # keep the gallery light
     save_json(PREVIEWS_FILE, previews)
+
+
+def has_intro():
+    return os.path.exists(INTRO_FILE)
+
+
+def has_outro():
+    return os.path.exists(OUTRO_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -238,20 +248,33 @@ Return ONLY valid JSON, no markdown fences:
 # Video composition
 # ---------------------------------------------------------------------------
 
-def build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path):
+def build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path, intro_path=None, outro_path=None):
     """
     Timeline:
+      Intro phase (optional): plays uploaded intro video fullscreen
       Phase 1 (0 -> hook):            reaction only, bottom-anchored, ~half screen height.
       Phase 2 (hook -> hook+pip_dur):  base fullscreen behind; reaction shrunk to a small
                                        box, vertically centered, right side. Audio = base only.
       Phase 3 (hook+pip_dur -> end):  reaction fullscreen for the rest of its own runtime
                                        (this is where your baked-in reveal line + CTA live).
+      Outro phase (optional): plays uploaded outro video fullscreen
 
     pip_dur is normally == base_dur (base plays out in full during the PiP phase). If the
     reaction clip isn't long enough to cover hook + base_dur, pip_dur is clamped down to
     whatever reaction footage is actually available, and the base video gets cut short to
     match (logged so it's obvious this happened).
     """
+    intro_dur = 0
+    outro_dur = 0
+    
+    # Probe intro/outro durations if they exist
+    if intro_path and os.path.exists(intro_path):
+        intro_dur = probe_duration_seconds(intro_path) or 0
+        log(f"  Intro duration: {intro_dur:.1f}s")
+    if outro_path and os.path.exists(outro_path):
+        outro_dur = probe_duration_seconds(outro_path) or 0
+        log(f"  Outro duration: {outro_dur:.1f}s")
+    
     hook = HOOK_SECONDS
     if reaction_dur <= hook + 0.5:
         # Reaction clip too short for a real hook+reveal split - shrink the hook instead
@@ -268,42 +291,99 @@ def build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_p
     hook_h = int(CANVAS_H * HOOK_HEIGHT_PCT)
     pip_w = int(CANVAS_W * PIP_WIDTH_PCT)
 
-    filter_complex = (
-        # Phase 1: reaction clip, bottom-anchored, half height, on a black canvas
+    # Build filter_complex with optional intro/outro
+    filter_parts = []
+    video_inputs = []  # track which input gets which index
+    audio_inputs = []
+    
+    input_idx = 0
+    video_concat_parts = []  # for final concat
+    audio_concat_parts = []
+    
+    # Input 0: base video, Input 1: reaction video, Input 2+: intro/outro if present
+    intro_input_idx = None
+    outro_input_idx = None
+    
+    if intro_path and os.path.exists(intro_path):
+        intro_input_idx = 2
+        filter_parts.append(
+            f"[{intro_input_idx}:v]scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
+            f"crop={CANVAS_W}:{CANVAS_H}[intro_v];"
+            f"[{intro_input_idx}:a]anull[intro_a]"
+        )
+        video_concat_parts.append("[intro_v]")
+        audio_concat_parts.append("[intro_a]")
+    
+    # Phase 1: reaction clip, bottom-anchored, half height, on a black canvas
+    filter_parts.append(
         f"color=c=black:s={CANVAS_W}x{CANVAS_H}:d={hook}[bg1];"
         f"[1:v]trim=0:{hook},setpts=PTS-STARTPTS,scale=-2:{hook_h}[r1];"
         f"[bg1][r1]overlay=(main_w-overlay_w)/2:main_h-overlay_h[p1v];"
-        f"[1:a]atrim=0:{hook},asetpts=PTS-STARTPTS[p1a];"
+        f"[1:a]atrim=0:{hook},asetpts=PTS-STARTPTS[p1a]"
+    )
+    video_concat_parts.append("[p1v]")
+    audio_concat_parts.append("[p1a]")
 
-        # Phase 2: base fullscreen (cropped to fill canvas) + reaction PiP, right-center
+    # Phase 2: base fullscreen (cropped to fill canvas) + reaction PiP, right-center
+    filter_parts.append(
         f"[0:v]trim=0:{pip_dur},setpts=PTS-STARTPTS,"
         f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
         f"crop={CANVAS_W}:{CANVAS_H}[p2bg];"
         f"[1:v]trim={hook}:{hook + pip_dur},setpts=PTS-STARTPTS,scale={pip_w}:-2[p2pip];"
         f"[p2bg][p2pip]overlay=main_w-overlay_w-{PIP_RIGHT_MARGIN}:(main_h-overlay_h)/2[p2v];"
-        f"[0:a]atrim=0:{pip_dur},asetpts=PTS-STARTPTS[p2a];"
+        f"[0:a]atrim=0:{pip_dur},asetpts=PTS-STARTPTS[p2a]"
+    )
+    video_concat_parts.append("[p2v]")
+    audio_concat_parts.append("[p2a]")
 
-        # Phase 3: reaction fullscreen for the remainder of its own runtime
+    # Phase 3: reaction fullscreen for the remainder of its own runtime
+    filter_parts.append(
         f"[1:v]trim={hook + pip_dur}:{reaction_dur},setpts=PTS-STARTPTS,"
         f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
         f"crop={CANVAS_W}:{CANVAS_H}[p3v];"
-        f"[1:a]atrim={hook + pip_dur}:{reaction_dur},asetpts=PTS-STARTPTS[p3a];"
-
-        # Stitch all three phases together
-        f"[p1v][p1a][p2v][p2a][p3v][p3a]concat=n=3:v=1:a=1[outv][outa]"
+        f"[1:a]atrim={hook + pip_dur}:{reaction_dur},asetpts=PTS-STARTPTS[p3a]"
     )
+    video_concat_parts.append("[p3v]")
+    audio_concat_parts.append("[p3a]")
+    
+    # Optional outro
+    if outro_path and os.path.exists(outro_path):
+        outro_input_idx = 2 if not intro_path else 3
+        filter_parts.append(
+            f"[{outro_input_idx}:v]scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
+            f"crop={CANVAS_W}:{CANVAS_H}[outro_v];"
+            f"[{outro_input_idx}:a]anull[outro_a]"
+        )
+        video_concat_parts.append("[outro_v]")
+        audio_concat_parts.append("[outro_a]")
+    
+    # Concat all phases
+    n_phases = len(video_concat_parts)
+    concat_inputs = "".join(video_concat_parts) + "".join(audio_concat_parts)
+    filter_parts.append(
+        f"{concat_inputs}concat=n={n_phases}:v=1:a=1[outv][outa]"
+    )
+    
+    filter_complex = ";".join(filter_parts)
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", base_path,
-        "-i", reaction_path,
+    # Build ffmpeg command with all inputs
+    cmd = ["ffmpeg", "-y"]
+    cmd.extend(["-i", base_path, "-i", reaction_path])
+    
+    if intro_path and os.path.exists(intro_path):
+        cmd.extend(["-i", intro_path])
+    if outro_path and os.path.exists(outro_path):
+        cmd.extend(["-i", outro_path])
+    
+    cmd.extend([
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "[outa]",
         "-threads", FFMPEG_THREADS,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", FFMPEG_THREADS,
         "-c:a", "aac", "-b:a", "128k",
         output_path,
-    ]
+    ])
+    
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0 or not os.path.exists(output_path):
         raise RuntimeError(f"ffmpeg compose failed (exit {result.returncode}):\n{result.stderr[-3000:]}")
@@ -352,10 +432,14 @@ def run_pipeline():
         reaction_path = os.path.join(WORK_DIR, f"reaction_{reaction_video['id']}.mp4")
         reaction_dur = download_tiktok_video(reaction_video["url"], reaction_path)
 
-        status("🎬 Compositing hook -> PiP -> reveal...")
+        status("🎬 Compositing intro -> hook -> PiP -> reveal -> outro...")
         output_name = f"ad_{base_video['id']}_{reaction_video['id']}.mp4"
         output_path = os.path.join(PREVIEW_DIR, output_name)
-        build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path)
+        
+        intro = INTRO_FILE if has_intro() else None
+        outro = OUTRO_FILE if has_outro() else None
+        
+        build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path, intro, outro)
 
         status("✍️ Writing caption + hashtags...")
         caption, hashtags = generate_caption_and_hashtags(base_video["title"])
@@ -410,7 +494,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       radial-gradient(1000px 500px at 100% 0%, rgba(255,59,92,0.14), transparent 55%), var(--bg);
     color: var(--text); padding: 32px 20px 60px;
   }
-  .wrap { max-width: 1000px; margin: 0 auto; }
+  .wrap { max-width: 1200px; margin: 0 auto; }
   header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
   .logo { width: 42px; height: 42px; border-radius: 12px;
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
@@ -418,7 +502,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
   .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
   .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
-  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
   .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
@@ -429,21 +513,25 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
   label:first-of-type { margin-top: 0; }
-  input[type=text] {
+  input[type=text], input[type=file] {
     width: 100%; background: var(--panel-2); border: 1px solid var(--border);
     border-radius: 10px; padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit;
   }
-  input[type=text]:focus { outline: none; border-color: var(--accent-2); }
+  input[type=text]:focus, input[type=file]:focus { outline: none; border-color: var(--accent-2); }
   button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
     color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
     cursor: pointer; letter-spacing: 0.01em; }
   button:hover { filter: brightness(1.08); }
   button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: rgba(255, 59, 92, 0.2); border: 1px solid rgba(255,59,92,0.4); color: var(--accent); margin-top: 8px; }
+  button.danger:hover { background: rgba(255, 59, 92, 0.3); }
   .feed { display: flex; flex-direction: column; gap: 8px; max-height: 220px; overflow-y: auto; margin-bottom: 4px; }
   .feed-item { background: #08080d; border: 1px solid var(--border); border-radius: 10px;
     padding: 10px 12px; font-size: 13px; line-height: 1.5; }
   .feed-empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
   .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  .file-status { font-size: 12px; color: var(--ok); margin-top: 4px; }
+  .file-status.none { color: var(--muted); }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
   .previews { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-top: 18px; }
   .preview-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
@@ -461,7 +549,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="logo">UGC</div>
     <div>
       <h1>UGC Reaction Ad Bot</h1>
-      <div class="sub">Random base clip + random reaction clip -&gt; auto-composited ad, for your review</div>
+      <div class="sub">Intro (optional) → Random base clip + reaction clip → Outro (optional)</div>
     </div>
   </header>
 
@@ -497,6 +585,24 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         LOOKBACK_COUNT.
       </div>
     </div>
+
+    <div class="card">
+      <h2>Intro & Outro (Optional)</h2>
+      <form method="POST" action="/upload-intro" enctype="multipart/form-data">
+        <label>Upload Intro Video (plays at start, fullscreen)</label>
+        <input type="file" name="intro_video" accept="video/mp4" required>
+        <button type="submit" class="secondary">Upload Intro</button>
+        <div class="file-status @@INTRO_STATUS@@">@@INTRO_TEXT@@</div>
+      </form>
+      <form method="POST" action="/upload-outro" enctype="multipart/form-data">
+        <label>Upload Outro Video (plays at end, fullscreen)</label>
+        <input type="file" name="outro_video" accept="video/mp4" required>
+        <button type="submit" class="secondary">Upload Outro</button>
+        <div class="file-status @@OUTRO_STATUS@@">@@OUTRO_TEXT@@</div>
+      </form>
+      @@DELETE_BUTTONS@@
+      <div class="hint">Intro plays on blank screen at the start. Outro plays after base video completes. Both fullscreen.</div>
+    </div>
   </div>
 
   <h2 style="margin-top:28px;">Rendered Previews</h2>
@@ -504,7 +610,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 @@PREVIEW_CARDS@@
   </div>
 
-  <footer>Timeline: hook (@@HOOK_SECONDS@@s) &rarr; PiP over base video &rarr; fullscreen reveal</footer>
+  <footer>Timeline: @@INTRO_TIMELINE@@ hook (@@HOOK_SECONDS@@s) &rarr; PiP over base video &rarr; fullscreen reveal @@OUTRO_TIMELINE@@</footer>
 </div>
 </body>
 </html>"""
@@ -546,6 +652,25 @@ def render_page():
     with pipeline_state_lock:
         running = pipeline_running
     previews = get_previews()
+    
+    intro_exists = has_intro()
+    outro_exists = has_outro()
+    
+    intro_status = "ok" if intro_exists else "none"
+    intro_text = "✅ Intro uploaded" if intro_exists else "No intro yet"
+    
+    outro_status = "ok" if outro_exists else "none"
+    outro_text = "✅ Outro uploaded" if outro_exists else "No outro yet"
+    
+    delete_buttons = ""
+    if intro_exists or outro_exists:
+        if intro_exists:
+            delete_buttons += '<form method="POST" action="/delete-intro" style="display:inline;"><button type="submit" class="danger" style="width:auto;margin-top:0;">Delete Intro</button></form>'
+        if outro_exists:
+            delete_buttons += '<form method="POST" action="/delete-outro" style="display:inline;margin-left:8px;"><button type="submit" class="danger" style="width:auto;margin-top:0;">Delete Outro</button></form>'
+
+    intro_timeline = "Intro → " if intro_exists else ""
+    outro_timeline = " → Outro" if outro_exists else ""
 
     html = PAGE_TEMPLATE
     html = html.replace("@@PREVIEW_COUNT@@", str(len(previews)))
@@ -556,6 +681,13 @@ def render_page():
     html = html.replace("@@REACTION_USERNAME@@", esc(cfg["reaction_username"]))
     html = html.replace("@@PREVIEW_CARDS@@", render_preview_cards())
     html = html.replace("@@HOOK_SECONDS@@", str(HOOK_SECONDS))
+    html = html.replace("@@INTRO_STATUS@@", intro_status)
+    html = html.replace("@@INTRO_TEXT@@", intro_text)
+    html = html.replace("@@OUTRO_STATUS@@", outro_status)
+    html = html.replace("@@OUTRO_TEXT@@", outro_text)
+    html = html.replace("@@DELETE_BUTTONS@@", delete_buttons)
+    html = html.replace("@@INTRO_TIMELINE@@", intro_timeline)
+    html = html.replace("@@OUTRO_TIMELINE@@", outro_timeline)
     return html
 
 
@@ -594,6 +726,25 @@ class Handler(BaseHTTPRequestHandler):
                 CONFIG["base_username"] = fields.get("base_username", "").strip().lstrip("@")
                 CONFIG["reaction_username"] = fields.get("reaction_username", "").strip().lstrip("@")
             log(f"Handles updated -> base=@{CONFIG['base_username']}, reaction=@{CONFIG['reaction_username']}")
+        
+        elif self.path == "/upload-intro":
+            self.handle_file_upload("intro")
+        
+        elif self.path == "/upload-outro":
+            self.handle_file_upload("outro")
+        
+        elif self.path == "/delete-intro":
+            if os.path.exists(INTRO_FILE):
+                os.remove(INTRO_FILE)
+                log("Intro video deleted")
+                status("🗑️ Intro deleted")
+        
+        elif self.path == "/delete-outro":
+            if os.path.exists(OUTRO_FILE):
+                os.remove(OUTRO_FILE)
+                log("Outro video deleted")
+                status("🗑️ Outro deleted")
+        
         elif self.path == "/generate":
             log("Manual generate triggered.")
             threading.Thread(target=run_pipeline, daemon=True).start()
@@ -602,6 +753,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def handle_file_upload(self, file_type):
+        """Handle intro/outro file uploads"""
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            return
+        
+        # Parse multipart form data
+        boundary = content_type.split("boundary=")[1].encode()
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        
+        # Extract file content (simplified parsing)
+        try:
+            parts = body.split(b"--" + boundary)
+            for part in parts:
+                if b"Content-Disposition" in part:
+                    # Extract filename and file content
+                    if f'name="{file_type}_video"' in part.decode("utf-8", errors="ignore"):
+                        # Find the actual file data
+                        file_data_start = part.find(b"\r\n\r\n") + 4
+                        file_data_end = part.rfind(b"\r\n")
+                        file_data = part[file_data_start:file_data_end]
+                        
+                        if len(file_data) > 1000:  # Sanity check
+                            target_file = INTRO_FILE if file_type == "intro" else OUTRO_FILE
+                            with open(target_file, "wb") as f:
+                                f.write(file_data)
+                            log(f"{file_type.capitalize()} file uploaded ({len(file_data)/1_000_000:.1f}MB)")
+                            status(f"✅ {file_type.capitalize()} uploaded successfully")
+                        break
+        except Exception as e:
+            log(f"Upload error: {e}")
+            status(f"❌ Upload failed: {e}")
 
     def log_message(self, *args):
         pass
