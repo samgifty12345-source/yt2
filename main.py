@@ -1,819 +1,474 @@
 import os
 import time
 import json
+import re
+import requests
+import threading
 import subprocess
 import tempfile
-import threading
-import urllib.parse
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import quote
 
-import yt_dlp
-import requests
+# API Keys & Credentials
+TIKTOK_ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "@iconspage1")
+INSTAGRAM_ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
+INSTAGRAM_BUSINESS_ACCOUNT_ID = os.environ.get("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
+FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")
+FACEBOOK_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "")
+SNAPCHAT_ACCESS_TOKEN = os.environ.get("SNAPCHAT_ACCESS_TOKEN", "")
+SNAPCHAT_PIXEL_ID = os.environ.get("SNAPCHAT_PIXEL_ID", "")
+YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
+YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+YOUTUBE_CHANNEL_ID = os.environ.get("YOUTUBE_CHANNEL_ID", "")  # jason_animation channel
+
+# Polling interval (check TikTok every N seconds)
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # 5 minutes
 
 WORK_DIR = tempfile.gettempdir()
-PREVIEW_DIR = os.path.join(WORK_DIR, "ugc_previews")
-os.makedirs(PREVIEW_DIR, exist_ok=True)
+HISTORY_FILE = "posted_tiktoks.txt"  # Track which TikToks we've already posted
 
-USED_VIDEOS_FILE = "used_videos.json"       # {"base": [id,id,...], "reaction": [id,id,...]}
-PREVIEWS_FILE = "previews.json"             # list of finished preview metadata, newest first
-INTRO_FILE = os.path.join(PREVIEW_DIR, "intro.mp4")     # optional intro video
-OUTRO_FILE = os.path.join(PREVIEW_DIR, "outro.mp4")     # optional outro video
-
-TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-
-MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))
-LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "20"))  # how many recent posts to scan per handle
-
-# Canvas is fixed to vertical 9:16 (TikTok/Reels/Shorts).
-CANVAS_W = int(os.environ.get("CANVAS_W", "1080"))
-CANVAS_H = int(os.environ.get("CANVAS_H", "1920"))
-
-# --- Timeline knobs -----------------------------------------------------
-# Phase 1: reaction clip plays alone for this many seconds - bottom-anchored,
-# roughly half the screen height ("watch this" hook).
-HOOK_SECONDS = float(os.environ.get("HOOK_SECONDS", "3"))
-HOOK_HEIGHT_PCT = float(os.environ.get("HOOK_HEIGHT_PCT", "0.5"))  # fraction of canvas height
-
-# Phase 2: reaction shrinks to a small box, vertically centered, right side,
-# while the base video plays fullscreen behind it. Runs exactly as long as
-# the base video does.
-PIP_WIDTH_PCT = float(os.environ.get("PIP_WIDTH_PCT", "0.36"))    # fraction of canvas width
-PIP_RIGHT_MARGIN = int(os.environ.get("PIP_RIGHT_MARGIN", "24"))  # px gap from right edge
-
-FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
-
+pipeline_log = ["TikTok repost bot ready. Monitoring @iconspage1..."]
 log_lock = threading.Lock()
-status_lock = threading.Lock()
-status_feed = []
-
-pipeline_state_lock = threading.Lock()
-pipeline_running = False
-
 
 def log(msg):
     print(msg, flush=True)
+    with log_lock:
+        pipeline_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        if len(pipeline_log) > 100:
+            pipeline_log.pop(0)
 
+def get_posted_videos():
+    """Load list of already-posted TikTok video IDs to avoid duplicates."""
+    if not os.path.exists(HISTORY_FILE):
+        return set()
+    with open(HISTORY_FILE) as f:
+        return set(line.strip() for line in f if line.strip())
 
-def status(msg):
-    print(f"[status] {msg}", flush=True)
-    with status_lock:
-        status_feed.append(msg)
-        if len(status_feed) > 60:
-            status_feed.pop(0)
+def mark_as_posted(video_id):
+    """Record that we've posted this video."""
+    with open(HISTORY_FILE, "a") as f:
+        f.write(f"{video_id}\n")
 
+# ============================================================================
+# TikTok Download (using yt-dlp - most reliable)
+# ============================================================================
 
-config_lock = threading.Lock()
-CONFIG = {
-    "base_username": os.environ.get("BASE_TIKTOK_USERNAME", "").strip().lstrip("@"),
-    "reaction_username": os.environ.get("REACTION_TIKTOK_USERNAME", "").strip().lstrip("@"),
-}
+def download_tiktok_video(video_url):
+    """Download TikTok video at highest quality using yt-dlp.
+    Returns: (video_path, audio_path, title, hashtags)"""
+    try:
+        log(f"  Downloading TikTok video: {video_url}")
+        
+        # Use yt-dlp to get highest quality
+        output_template = os.path.join(WORK_DIR, "tiktok_%(id)s.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "-f", "best[ext=mp4]",  # Highest quality MP4
+            "--write-info-json",
+            "-o", output_template,
+            video_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            log(f"    yt-dlp error: {result.stderr}")
+            return None, None, None, None
+        
+        # Find the downloaded file
+        video_files = sorted(Path(WORK_DIR).glob("tiktok_*.mp4"))
+        if not video_files:
+            log("    No video file found after download")
+            return None, None, None, None
+        
+        video_path = str(video_files[-1])
+        
+        # Try to extract metadata from info JSON
+        info_path = video_path.replace(".mp4", ".info.json")
+        title, hashtags = "TikTok Video", []
+        
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                info = json.load(f)
+                title = info.get("title", "TikTok Video")[:100]
+                # Extract hashtags from description
+                desc = info.get("description", "")
+                hashtags = re.findall(r"#\w+", desc)
+        
+        log(f"    Downloaded: {video_path}")
+        log(f"    Title: {title}")
+        log(f"    Hashtags: {', '.join(hashtags)}")
+        
+        return video_path, title, hashtags, info_path
+        
+    except Exception as e:
+        log(f"    Download failed: {e}")
+        return None, None, None, None
 
+# ============================================================================
+# Upload Functions
+# ============================================================================
 
-def get_config():
-    with config_lock:
-        return dict(CONFIG)
+def upload_to_instagram(video_path, title, hashtags):
+    """Upload to Instagram using Meta Graph API."""
+    if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_BUSINESS_ACCOUNT_ID:
+        log("  Skipping Instagram (no credentials)")
+        return False
+    
+    try:
+        log("  Uploading to Instagram...")
+        
+        caption = f"{title}\n\n{' '.join(hashtags)}"
+        
+        # Upload video to Instagram
+        url = f"https://graph.instagram.com/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media"
+        
+        with open(video_path, "rb") as f:
+            files = {"media_source": f}
+            data = {
+                "caption": caption,
+                "media_type": "VIDEO",
+                "access_token": INSTAGRAM_ACCESS_TOKEN
+            }
+            res = requests.post(url, files=files, data=data, timeout=120)
+        
+        if res.status_code in (200, 201):
+            media_id = res.json().get("id")
+            log(f"    Posted to Instagram (ID: {media_id})")
+            return True
+        else:
+            log(f"    Instagram error {res.status_code}: {res.text[:300]}")
+            return False
+    except Exception as e:
+        log(f"    Instagram upload failed: {e}")
+        return False
 
+def upload_to_facebook(video_path, title, hashtags):
+    """Upload to Facebook using Meta Graph API."""
+    if not FACEBOOK_ACCESS_TOKEN or not FACEBOOK_PAGE_ID:
+        log("  Skipping Facebook (no credentials)")
+        return False
+    
+    try:
+        log("  Uploading to Facebook...")
+        
+        caption = f"{title}\n\n{' '.join(hashtags)}"
+        
+        url = f"https://graph.facebook.com/{FACEBOOK_PAGE_ID}/videos"
+        
+        with open(video_path, "rb") as f:
+            files = {"source": f}
+            data = {
+                "title": title,
+                "description": caption,
+                "access_token": FACEBOOK_ACCESS_TOKEN
+            }
+            res = requests.post(url, files=files, data=data, timeout=120)
+        
+        if res.status_code in (200, 201):
+            video_id = res.json().get("id")
+            log(f"    Posted to Facebook (ID: {video_id})")
+            return True
+        else:
+            log(f"    Facebook error {res.status_code}: {res.text[:300]}")
+            return False
+    except Exception as e:
+        log(f"    Facebook upload failed: {e}")
+        return False
 
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path) as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return default
-    return default
+def upload_to_snapchat(video_path, title, hashtags):
+    """Upload to Snapchat using Snapchat Marketing API."""
+    if not SNAPCHAT_ACCESS_TOKEN or not SNAPCHAT_PIXEL_ID:
+        log("  Skipping Snapchat (no credentials)")
+        return False
+    
+    try:
+        log("  Uploading to Snapchat...")
+        
+        caption = f"{title}\n\n{' '.join(hashtags)}"
+        
+        # Snapchat's Media Library API
+        url = "https://adsapi.snapchat.com/v1/media/upload"
+        
+        with open(video_path, "rb") as f:
+            files = {"file": f}
+            headers = {
+                "Authorization": f"Bearer {SNAPCHAT_ACCESS_TOKEN}"
+            }
+            data = {
+                "name": title
+            }
+            res = requests.post(url, files=files, headers=headers, data=data, timeout=120)
+        
+        if res.status_code in (200, 201):
+            media_id = res.json().get("media", {}).get("id")
+            log(f"    Posted to Snapchat (ID: {media_id})")
+            return True
+        else:
+            log(f"    Snapchat error {res.status_code}: {res.text[:300]}")
+            return False
+    except Exception as e:
+        log(f"    Snapchat upload failed: {e}")
+        return False
 
+def upload_to_youtube(video_path, title, hashtags):
+    """Upload to YouTube using Google API."""
+    if not YOUTUBE_REFRESH_TOKEN or not YOUTUBE_CLIENT_ID or not YOUTUBE_CLIENT_SECRET:
+        log("  Skipping YouTube (no credentials)")
+        return False
+    
+    try:
+        log("  Uploading to YouTube...")
+        
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+        
+        creds = Credentials(
+            token=None,
+            refresh_token=YOUTUBE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=YOUTUBE_CLIENT_ID,
+            client_secret=YOUTUBE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/youtube.upload"]
+        )
+        creds.refresh(Request())
+        
+        youtube = build("youtube", "v3", credentials=creds)
+        
+        description = f"{title}\n\n{' '.join(hashtags)}"
+        
+        body = {
+            "snippet": {
+                "title": title[:100],
+                "description": description,
+                "categoryId": "20"  # Shorts category
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False
+            }
+        }
+        
+        media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
+        req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        
+        response = None
+        while response is None:
+            status, response = req.next_chunk()
+        
+        video_id = response.get("id")
+        log(f"    Posted to YouTube: https://youtube.com/watch?v={video_id}")
+        return True
+        
+    except Exception as e:
+        log(f"    YouTube upload failed: {e}")
+        return False
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+# ============================================================================
+# TikTok Monitoring
+# ============================================================================
 
-
-def get_used_videos():
-    return load_json(USED_VIDEOS_FILE, {"base": [], "reaction": []})
-
-
-def mark_used(pool, video_id):
-    used = get_used_videos()
-    used.setdefault(pool, [])
-    if video_id not in used[pool]:
-        used[pool].append(video_id)
-    save_json(USED_VIDEOS_FILE, used)
-
-
-def get_previews():
-    return load_json(PREVIEWS_FILE, [])
-
-
-def add_preview(entry):
-    previews = get_previews()
-    previews.insert(0, entry)
-    previews = previews[:30]  # keep the gallery light
-    save_json(PREVIEWS_FILE, previews)
-
-
-def has_intro():
-    return os.path.exists(INTRO_FILE)
-
-
-def has_outro():
-    return os.path.exists(OUTRO_FILE)
-
-
-# ---------------------------------------------------------------------------
-# TikTok fetching (same approach as the TikTok->YouTube reposter bot)
-# ---------------------------------------------------------------------------
-
-def get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT):
-    profile_url = f"https://www.tiktok.com/@{username}"
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": "in_playlist",
-        "playlistend": limit,
-    }
-    if TIKTOK_COOKIES_FILE:
-        ydl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
-
-    entries = info.get("entries") if info else None
-    if not entries:
+def get_tiktok_video_urls():
+    """Fetch recent videos from TikTok account using web scraping.
+    Returns list of (video_url, video_id) tuples."""
+    try:
+        log(f"Checking TikTok account {TIKTOK_ACCOUNT}...")
+        
+        # Using unofficial TikTok API / scraper
+        # For production, use: https://github.com/davidteather/TikTok-Api
+        # or install: pip install TikTokApi
+        
+        # Fallback: Use yt-dlp to list videos from profile
+        account_url = f"https://www.tiktok.com/{TIKTOK_ACCOUNT}"
+        
+        cmd = [
+            "yt-dlp",
+            "--flat-playlist",
+            "-j",
+            account_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            log(f"  Error fetching TikTok profile: {result.stderr[:200]}")
+            return []
+        
+        videos = []
+        for line in result.stdout.strip().split("\n"):
+            if line.strip():
+                try:
+                    entry = json.loads(line)
+                    url = entry.get("url") or f"https://www.tiktok.com/@{TIKTOK_ACCOUNT}/video/{entry.get('id')}"
+                    video_id = entry.get("id", "").split("_")[-1]
+                    videos.append((url, video_id))
+                except:
+                    pass
+        
+        log(f"  Found {len(videos)} videos")
+        return videos
+        
+    except Exception as e:
+        log(f"  Error fetching TikTok videos: {e}")
         return []
 
-    videos = []
-    for entry in entries:
-        video_id = entry.get("id")
-        if not video_id:
-            continue
-        videos.append({
-            "id": video_id,
-            "title": entry.get("title") or f"TikTok video {video_id}",
-            "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{video_id}",
-        })
-    return videos
-
-
-def probe_duration_seconds(filepath):
+def process_video(video_url, video_id):
+    """Download and repost a single TikTok video to all platforms."""
+    log(f"\nProcessing TikTok video {video_id}...")
+    
+    video_path = None
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-        return float(result.stdout.strip())
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        return None
-
-
-def download_tiktok_video(video_url, filepath):
-    log(f"  Fetching: {video_url}")
-    dl_opts = {
-        "quiet": True, "no_warnings": True,
-        "outtmpl": filepath, "format": "mp4/best",
-    }
-    if TIKTOK_COOKIES_FILE:
-        dl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
-    with yt_dlp.YoutubeDL(dl_opts) as ydl:
-        ydl.download([video_url])
-
-    if not os.path.exists(filepath):
-        raise RuntimeError("Download reported success but no file was written")
-    size = os.path.getsize(filepath)
-    if size < MIN_VALID_FILE_BYTES:
-        os.remove(filepath)
-        raise RuntimeError(f"Downloaded file too small ({size} bytes) - likely blocked by TikTok.")
-    duration = probe_duration_seconds(filepath)
-    if duration is None or duration < 1.0:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        raise RuntimeError("Downloaded file isn't a valid/complete video - likely blocked by TikTok.")
-    log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
-    return duration
-
-
-def pick_unused_video(username, pool):
-    """Random unused pick from the given handle's recent videos, for the given pool
-    ('base' or 'reaction'). Returns None if everything recent has already been used."""
-    used = get_used_videos().get(pool, [])
-    videos = get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT)
-    candidates = [v for v in videos if v["id"] not in used]
-    if not candidates:
-        return None
-    import random
-    return random.choice(candidates)
-
-
-# ---------------------------------------------------------------------------
-# Caption / hashtag generation (Groq - same provider as the AI history bot)
-# ---------------------------------------------------------------------------
-
-def generate_caption_and_hashtags(base_title):
-    if not GROQ_API_KEY:
-        return "New one dropped 👀", "#fyi #factcheck #ai"
-    prompt = f"""You write short, punchy captions for a UGC-style reaction video on TikTok/Instagram.
-The reaction is a "let's fact-check this claim" format. The base clip being reacted to is
-titled/described: "{base_title}"
-
-Return ONLY valid JSON, no markdown fences:
-{{"caption": "one short punchy caption line, under 100 chars", "hashtags": "5-8 space-separated lowercase hashtags with # symbol"}}"""
-    try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "openai/gpt-oss-120b",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.8,
-                "max_tokens": 300,
-                "reasoning_effort": "low",
-            },
-            timeout=30,
-        )
-        res.raise_for_status()
-        content = res.json()["choices"][0]["message"]["content"].strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-        data = json.loads(content)
-        return data.get("caption", ""), data.get("hashtags", "")
-    except Exception as e:
-        log(f"  Caption generation failed, using fallback: {e}")
-        return "New one dropped 👀", "#fyi #factcheck #ai"
-
-
-# ---------------------------------------------------------------------------
-# Video composition
-# ---------------------------------------------------------------------------
-
-def build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path, intro_path=None, outro_path=None):
-    """
-    Timeline:
-      Intro phase (optional): plays uploaded intro video fullscreen
-      Phase 1 (0 -> hook):            reaction only, bottom-anchored, ~half screen height.
-      Phase 2 (hook -> hook+pip_dur):  base fullscreen behind; reaction shrunk to a small
-                                       box, vertically centered, right side. Audio = base only.
-      Phase 3 (hook+pip_dur -> end):  reaction fullscreen for the rest of its own runtime
-                                       (this is where your baked-in reveal line + CTA live).
-      Outro phase (optional): plays uploaded outro video fullscreen
-
-    pip_dur is normally == base_dur (base plays out in full during the PiP phase). If the
-    reaction clip isn't long enough to cover hook + base_dur, pip_dur is clamped down to
-    whatever reaction footage is actually available, and the base video gets cut short to
-    match (logged so it's obvious this happened).
-    """
-    intro_dur = 0
-    outro_dur = 0
-    
-    # Probe intro/outro durations if they exist
-    if intro_path and os.path.exists(intro_path):
-        intro_dur = probe_duration_seconds(intro_path) or 0
-        log(f"  Intro duration: {intro_dur:.1f}s")
-    if outro_path and os.path.exists(outro_path):
-        outro_dur = probe_duration_seconds(outro_path) or 0
-        log(f"  Outro duration: {outro_dur:.1f}s")
-    
-    hook = HOOK_SECONDS
-    if reaction_dur <= hook + 0.5:
-        # Reaction clip too short for a real hook+reveal split - shrink the hook instead
-        # of failing outright.
-        hook = max(0.5, reaction_dur * 0.25)
-        log(f"  Reaction clip is short ({reaction_dur:.1f}s) - reducing hook to {hook:.1f}s")
-
-    available_for_pip = max(0.5, reaction_dur - hook)
-    pip_dur = min(base_dur, available_for_pip)
-    if pip_dur < base_dur:
-        log(f"  Base video ({base_dur:.1f}s) longer than available reaction footage - "
-            f"trimming base to {pip_dur:.1f}s for the PiP phase.")
-
-    hook_h = int(CANVAS_H * HOOK_HEIGHT_PCT)
-    pip_w = int(CANVAS_W * PIP_WIDTH_PCT)
-
-    # Build filter_complex with optional intro/outro
-    filter_parts = []
-    video_inputs = []  # track which input gets which index
-    audio_inputs = []
-    
-    input_idx = 0
-    video_concat_parts = []  # for final concat
-    audio_concat_parts = []
-    
-    # Input 0: base video, Input 1: reaction video, Input 2+: intro/outro if present
-    intro_input_idx = None
-    outro_input_idx = None
-    
-    if intro_path and os.path.exists(intro_path):
-        intro_input_idx = 2
-        filter_parts.append(
-            f"[{intro_input_idx}:v]scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
-            f"crop={CANVAS_W}:{CANVAS_H}[intro_v];"
-            f"[{intro_input_idx}:a]anull[intro_a]"
-        )
-        video_concat_parts.append("[intro_v]")
-        audio_concat_parts.append("[intro_a]")
-    
-    # Phase 1: reaction clip, bottom-anchored, half height, on a black canvas
-    filter_parts.append(
-        f"color=c=black:s={CANVAS_W}x{CANVAS_H}:d={hook}[bg1];"
-        f"[1:v]trim=0:{hook},setpts=PTS-STARTPTS,scale=-2:{hook_h}[r1];"
-        f"[bg1][r1]overlay=(main_w-overlay_w)/2:main_h-overlay_h[p1v];"
-        f"[1:a]atrim=0:{hook},asetpts=PTS-STARTPTS[p1a]"
-    )
-    video_concat_parts.append("[p1v]")
-    audio_concat_parts.append("[p1a]")
-
-    # Phase 2: base fullscreen (cropped to fill canvas) + reaction PiP, right-center
-    filter_parts.append(
-        f"[0:v]trim=0:{pip_dur},setpts=PTS-STARTPTS,"
-        f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
-        f"crop={CANVAS_W}:{CANVAS_H}[p2bg];"
-        f"[1:v]trim={hook}:{hook + pip_dur},setpts=PTS-STARTPTS,scale={pip_w}:-2[p2pip];"
-        f"[p2bg][p2pip]overlay=main_w-overlay_w-{PIP_RIGHT_MARGIN}:(main_h-overlay_h)/2[p2v];"
-        f"[0:a]atrim=0:{pip_dur},asetpts=PTS-STARTPTS[p2a]"
-    )
-    video_concat_parts.append("[p2v]")
-    audio_concat_parts.append("[p2a]")
-
-    # Phase 3: reaction fullscreen for the remainder of its own runtime
-    filter_parts.append(
-        f"[1:v]trim={hook + pip_dur}:{reaction_dur},setpts=PTS-STARTPTS,"
-        f"scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
-        f"crop={CANVAS_W}:{CANVAS_H}[p3v];"
-        f"[1:a]atrim={hook + pip_dur}:{reaction_dur},asetpts=PTS-STARTPTS[p3a]"
-    )
-    video_concat_parts.append("[p3v]")
-    audio_concat_parts.append("[p3a]")
-    
-    # Optional outro
-    if outro_path and os.path.exists(outro_path):
-        outro_input_idx = 2 if not intro_path else 3
-        filter_parts.append(
-            f"[{outro_input_idx}:v]scale={CANVAS_W}:{CANVAS_H}:force_original_aspect_ratio=increase,"
-            f"crop={CANVAS_W}:{CANVAS_H}[outro_v];"
-            f"[{outro_input_idx}:a]anull[outro_a]"
-        )
-        video_concat_parts.append("[outro_v]")
-        audio_concat_parts.append("[outro_a]")
-    
-    # Concat all phases
-    n_phases = len(video_concat_parts)
-    concat_inputs = "".join(video_concat_parts) + "".join(audio_concat_parts)
-    filter_parts.append(
-        f"{concat_inputs}concat=n={n_phases}:v=1:a=1[outv][outa]"
-    )
-    
-    filter_complex = ";".join(filter_parts)
-
-    # Build ffmpeg command with all inputs
-    cmd = ["ffmpeg", "-y"]
-    cmd.extend(["-i", base_path, "-i", reaction_path])
-    
-    if intro_path and os.path.exists(intro_path):
-        cmd.extend(["-i", intro_path])
-    if outro_path and os.path.exists(outro_path):
-        cmd.extend(["-i", outro_path])
-    
-    cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", "[outa]",
-        "-threads", FFMPEG_THREADS,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", FFMPEG_THREADS,
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ])
-    
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    if result.returncode != 0 or not os.path.exists(output_path):
-        raise RuntimeError(f"ffmpeg compose failed (exit {result.returncode}):\n{result.stderr[-3000:]}")
-    log(f"  Composed ad ready ({os.path.getsize(output_path) / 1_000_000:.1f} MB)")
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-
-def run_pipeline():
-    global pipeline_running
-    with pipeline_state_lock:
-        if pipeline_running:
-            log("Generation already running - ignoring this trigger.")
-            status("⏳ Already generating one - hang tight.")
-            return
-        pipeline_running = True
-
-    base_path = reaction_path = output_path = None
-    try:
-        cfg = get_config()
-        base_username = cfg["base_username"]
-        reaction_username = cfg["reaction_username"]
-        if not base_username or not reaction_username:
-            status("❌ Set both TikTok handles (base clips + reaction clips) before generating.")
-            return
-
-        status(f"🔍 Picking a fresh base clip from @{base_username}...")
-        base_video = pick_unused_video(base_username, "base")
-        if not base_video:
-            status(f"❌ No unused base clips left from @{base_username} in the last {LOOKBACK_COUNT} posts.")
-            return
-
-        status(f"🔍 Picking a fresh reaction clip from @{reaction_username}...")
-        reaction_video = pick_unused_video(reaction_username, "reaction")
-        if not reaction_video:
-            status(f"❌ No unused reaction clips left from @{reaction_username} in the last {LOOKBACK_COUNT} posts.")
-            return
-
-        status(f"📥 Downloading base clip ({base_video['id']})...")
-        base_path = os.path.join(WORK_DIR, f"base_{base_video['id']}.mp4")
-        base_dur = download_tiktok_video(base_video["url"], base_path)
-
-        status(f"📥 Downloading reaction clip ({reaction_video['id']})...")
-        reaction_path = os.path.join(WORK_DIR, f"reaction_{reaction_video['id']}.mp4")
-        reaction_dur = download_tiktok_video(reaction_video["url"], reaction_path)
-
-        status("🎬 Compositing intro -> hook -> PiP -> reveal -> outro...")
-        output_name = f"ad_{base_video['id']}_{reaction_video['id']}.mp4"
-        output_path = os.path.join(PREVIEW_DIR, output_name)
+        # Download
+        video_path, title, hashtags, info_path = download_tiktok_video(video_url)
+        if not video_path:
+            return False
         
-        intro = INTRO_FILE if has_intro() else None
-        outro = OUTRO_FILE if has_outro() else None
+        log(f"  Reposting to all platforms...")
         
-        build_reaction_ad(base_path, base_dur, reaction_path, reaction_dur, output_path, intro, outro)
-
-        status("✍️ Writing caption + hashtags...")
-        caption, hashtags = generate_caption_and_hashtags(base_video["title"])
-
-        mark_used("base", base_video["id"])
-        mark_used("reaction", reaction_video["id"])
-
-        add_preview({
-            "file": output_name,
-            "created_at": time.time(),
-            "caption": caption,
-            "hashtags": hashtags,
-            "base_title": base_video["title"],
-            "base_url": base_video["url"],
-            "reaction_url": reaction_video["url"],
-        })
-        status(f"✅ Ready to review - new preview added below.")
-
+        # Upload to each platform
+        upload_to_instagram(video_path, title, hashtags)
+        upload_to_facebook(video_path, title, hashtags)
+        upload_to_snapchat(video_path, title, hashtags)
+        upload_to_youtube(video_path, title, hashtags)
+        
+        # Mark as done
+        mark_as_posted(video_id)
+        log(f"  ✓ Completed: {title}")
+        return True
+        
     except Exception as e:
-        log(f"Pipeline error: {e}")
-        status(f"❌ Generation failed: {type(e).__name__}: {e}")
+        log(f"  Error processing video: {e}")
+        return False
     finally:
-        for p in (base_path, reaction_path):
+        # Cleanup
+        for f in [video_path, info_path]:
             try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except:
                 pass
-        with pipeline_state_lock:
-            pipeline_running = False
 
+def monitoring_loop():
+    """Main loop: periodically check TikTok and repost new videos."""
+    posted = get_posted_videos()
+    log(f"Loaded history: {len(posted)} videos already posted")
+    
+    while True:
+        try:
+            videos = get_tiktok_video_urls()
+            
+            for url, video_id in videos:
+                if video_id not in posted:
+                    if process_video(url, video_id):
+                        posted.add(video_id)
+            
+            log(f"Waiting {POLL_INTERVAL}s until next check...")
+            time.sleep(POLL_INTERVAL)
+            
+        except Exception as e:
+            log(f"Monitoring loop error: {e}")
+            time.sleep(60)
 
-# ---------------------------------------------------------------------------
-# Web UI
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Web Dashboard
+# ============================================================================
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="utf-8">
-<title>UGC Reaction Ad Bot</title>
+<title>TikTok Repost Bot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root {
-    --bg: #0b0b10; --panel: #14141c; --panel-2: #1b1b26; --border: #26263a;
-    --text: #eaeaf2; --muted: #8a8aa0; --accent: #ff3b5c; --accent-2: #7c5cff; --ok: #35d488;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
-    background: radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,0.18), transparent 60%),
-      radial-gradient(1000px 500px at 100% 0%, rgba(255,59,92,0.14), transparent 55%), var(--bg);
-    color: var(--text); padding: 32px 20px 60px;
-  }
-  .wrap { max-width: 1200px; margin: 0 auto; }
-  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
-  .logo { width: 42px; height: 42px; border-radius: 12px;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; flex-shrink: 0; }
-  h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
-  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
-  .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
-  @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr 1fr; } }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
-  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
-  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-  .badge { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
-    padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
-  .badge b { color: var(--text); }
-  .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
-  .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
-  label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
-  label:first-of-type { margin-top: 0; }
-  input[type=text], input[type=file] {
-    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px; color: var(--text); font-size: 14px; font-family: inherit;
-  }
-  input[type=text]:focus, input[type=file]:focus { outline: none; border-color: var(--accent-2); }
-  button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
-    cursor: pointer; letter-spacing: 0.01em; }
-  button:hover { filter: brightness(1.08); }
-  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
-  button.danger { background: rgba(255, 59, 92, 0.2); border: 1px solid rgba(255,59,92,0.4); color: var(--accent); margin-top: 8px; }
-  button.danger:hover { background: rgba(255, 59, 92, 0.3); }
-  .feed { display: flex; flex-direction: column; gap: 8px; max-height: 220px; overflow-y: auto; margin-bottom: 4px; }
-  .feed-item { background: #08080d; border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 12px; font-size: 13px; line-height: 1.5; }
-  .feed-empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
-  .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
-  .file-status { font-size: 12px; color: var(--ok); margin-top: 4px; }
-  .file-status.none { color: var(--muted); }
-  footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
-  .previews { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-top: 18px; }
-  .preview-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
-  .preview-card video { width: 100%; border-radius: 10px; background: #000; aspect-ratio: 9/16; }
-  .preview-card .cap { font-size: 12.5px; margin-top: 8px; color: var(--text); }
-  .preview-card .tags { font-size: 11.5px; color: var(--accent-2); margin-top: 4px; }
-  .preview-card .srcs { font-size: 10.5px; color: var(--muted); margin-top: 6px; }
-  .preview-card .srcs a { color: var(--muted); }
-  .preview-empty { color: var(--muted); font-size: 13px; grid-column: 1/-1; }
+  body { font-family: -apple-system, sans-serif; background: #0b0b10; color: #eaeaf2; padding: 20px; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { margin-top: 0; }
+  .card { background: #14141c; border: 1px solid #26263a; border-radius: 12px; padding: 20px; margin: 20px 0; }
+  .log { background: #08080d; border: 1px solid #26263a; border-radius: 8px; padding: 12px; 
+         font-family: monospace; font-size: 12px; color: #8fe3a8; max-height: 400px; 
+         overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
+  .status { color: #35d488; font-weight: bold; }
+  .error { color: #ff3b5c; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <div class="logo">UGC</div>
-    <div>
-      <h1>UGC Reaction Ad Bot</h1>
-      <div class="sub">Intro (optional) → Random base clip + reaction clip → Outro (optional)</div>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="card">
-      <h2>Status</h2>
-      <div class="badges">
-        <div class="badge">Rendered <b>@@PREVIEW_COUNT@@</b></div>
-        <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
-      </div>
-      <div class="feed">@@FEED_CONTENT@@</div>
-      <form method="POST" action="/generate">
-        <button type="submit">Generate New Ad</button>
-      </form>
-      <div class="hint">
-        Posting to TikTok/Instagram is intentionally OFF for now - this only renders the video
-        so you can review the cuts before we wire up real accounts.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Source Handles</h2>
-      <form method="POST" action="/configure">
-        <label>Base clips TikTok handle (professor/claim videos)</label>
-        <input type="text" name="base_username" value="@@BASE_USERNAME@@" placeholder="username, no @">
-        <label>Reaction clips TikTok handle (you)</label>
-        <input type="text" name="reaction_username" value="@@REACTION_USERNAME@@" placeholder="username, no @">
-        <button type="submit" class="secondary">Save Handles</button>
-      </form>
-      <div class="hint">
-        Each generation picks one unused video from each handle at random and never reuses it.
-        Once a handle's recent videos are all used up, add newer posts to that account or raise
-        LOOKBACK_COUNT.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Intro & Outro (Optional)</h2>
-      <form method="POST" action="/upload-intro" enctype="multipart/form-data">
-        <label>Upload Intro Video (plays at start, fullscreen)</label>
-        <input type="file" name="intro_video" accept="video/mp4" required>
-        <button type="submit" class="secondary">Upload Intro</button>
-        <div class="file-status @@INTRO_STATUS@@">@@INTRO_TEXT@@</div>
-      </form>
-      <form method="POST" action="/upload-outro" enctype="multipart/form-data">
-        <label>Upload Outro Video (plays at end, fullscreen)</label>
-        <input type="file" name="outro_video" accept="video/mp4" required>
-        <button type="submit" class="secondary">Upload Outro</button>
-        <div class="file-status @@OUTRO_STATUS@@">@@OUTRO_TEXT@@</div>
-      </form>
-      @@DELETE_BUTTONS@@
-      <div class="hint">Intro plays on blank screen at the start. Outro plays after base video completes. Both fullscreen.</div>
-    </div>
+  <h1>🎵 TikTok → All Platforms Repost Bot</h1>
+  
+  <div class="card">
+    <h2>Status</h2>
+    <p><span class="status">✓ Monitoring:</span> @@ACCOUNT@@</p>
+    <p>Polling interval: @@INTERVAL@@s | Posted: @@POSTED_COUNT@@</p>
   </div>
-
-  <h2 style="margin-top:28px;">Rendered Previews</h2>
-  <div class="previews">
-@@PREVIEW_CARDS@@
+  
+  <div class="card">
+    <h2>Platforms Connected</h2>
+    <p>✓ Instagram: @@INSTAGRAM@@</p>
+    <p>✓ Facebook: @@FACEBOOK@@</p>
+    <p>✓ Snapchat: @@SNAPCHAT@@</p>
+    <p>✓ YouTube: @@YOUTUBE@@</p>
   </div>
-
-  <footer>Timeline: @@INTRO_TIMELINE@@ hook (@@HOOK_SECONDS@@s) &rarr; PiP over base video &rarr; fullscreen reveal @@OUTRO_TIMELINE@@</footer>
+  
+  <div class="card">
+    <h2>Activity Log</h2>
+    <div class="log">@@LOG@@</div>
+  </div>
 </div>
 </body>
 </html>"""
 
-
-def esc(s):
-    return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def render_feed_html():
-    with status_lock:
-        items = list(status_feed[-20:])
-    if not items:
-        return '<div class="feed-empty">Nothing yet - click "Generate New Ad".</div>'
-    return "\n".join(f'<div class="feed-item">{esc(item)}</div>' for item in reversed(items))
-
-
-def render_preview_cards():
-    previews = get_previews()
-    if not previews:
-        return '<div class="preview-empty">No renders yet - click "Generate New Ad" to make your first one.</div>'
-    cards = []
-    for p in previews:
-        cards.append(
-            f'<div class="preview-card">'
-            f'<video controls preload="metadata" src="/previews/{esc(p["file"])}"></video>'
-            f'<div class="cap">{esc(p.get("caption", ""))}</div>'
-            f'<div class="tags">{esc(p.get("hashtags", ""))}</div>'
-            f'<div class="srcs">Base: {esc(p.get("base_title", ""))}<br>'
-            f'<a href="{esc(p.get("base_url",""))}" target="_blank">base source</a> &middot; '
-            f'<a href="{esc(p.get("reaction_url",""))}" target="_blank">reaction source</a></div>'
-            f'</div>'
-        )
-    return "\n".join(cards)
-
-
-def render_page():
-    cfg = get_config()
-    with pipeline_state_lock:
-        running = pipeline_running
-    previews = get_previews()
+def render_dashboard():
+    with log_lock:
+        log_text = "\n".join(pipeline_log[-50:])
     
-    intro_exists = has_intro()
-    outro_exists = has_outro()
+    posted = len(get_posted_videos())
     
-    intro_status = "ok" if intro_exists else "none"
-    intro_text = "✅ Intro uploaded" if intro_exists else "No intro yet"
-    
-    outro_status = "ok" if outro_exists else "none"
-    outro_text = "✅ Outro uploaded" if outro_exists else "No outro yet"
-    
-    delete_buttons = ""
-    if intro_exists or outro_exists:
-        if intro_exists:
-            delete_buttons += '<form method="POST" action="/delete-intro" style="display:inline;"><button type="submit" class="danger" style="width:auto;margin-top:0;">Delete Intro</button></form>'
-        if outro_exists:
-            delete_buttons += '<form method="POST" action="/delete-outro" style="display:inline;margin-left:8px;"><button type="submit" class="danger" style="width:auto;margin-top:0;">Delete Outro</button></form>'
-
-    intro_timeline = "Intro → " if intro_exists else ""
-    outro_timeline = " → Outro" if outro_exists else ""
-
     html = PAGE_TEMPLATE
-    html = html.replace("@@PREVIEW_COUNT@@", str(len(previews)))
-    html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
-    html = html.replace("@@RUNNING_TEXT@@", "Generating..." if running else "Idle")
-    html = html.replace("@@FEED_CONTENT@@", render_feed_html())
-    html = html.replace("@@BASE_USERNAME@@", esc(cfg["base_username"]))
-    html = html.replace("@@REACTION_USERNAME@@", esc(cfg["reaction_username"]))
-    html = html.replace("@@PREVIEW_CARDS@@", render_preview_cards())
-    html = html.replace("@@HOOK_SECONDS@@", str(HOOK_SECONDS))
-    html = html.replace("@@INTRO_STATUS@@", intro_status)
-    html = html.replace("@@INTRO_TEXT@@", intro_text)
-    html = html.replace("@@OUTRO_STATUS@@", outro_status)
-    html = html.replace("@@OUTRO_TEXT@@", outro_text)
-    html = html.replace("@@DELETE_BUTTONS@@", delete_buttons)
-    html = html.replace("@@INTRO_TIMELINE@@", intro_timeline)
-    html = html.replace("@@OUTRO_TIMELINE@@", outro_timeline)
+    html = html.replace("@@ACCOUNT@@", TIKTOK_ACCOUNT)
+    html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL))
+    html = html.replace("@@POSTED_COUNT@@", str(posted))
+    html = html.replace("@@INSTAGRAM@@", "Configured" if INSTAGRAM_ACCESS_TOKEN else "Not set up")
+    html = html.replace("@@FACEBOOK@@", "Configured" if FACEBOOK_ACCESS_TOKEN else "Not set up")
+    html = html.replace("@@SNAPCHAT@@", "Configured" if SNAPCHAT_ACCESS_TOKEN else "Not set up")
+    html = html.replace("@@YOUTUBE@@", "Configured" if YOUTUBE_REFRESH_TOKEN else "Not set up")
+    html = html.replace("@@LOG@@", log_text)
+    
     return html
-
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/previews/"):
-            filename = os.path.basename(urllib.parse.unquote(self.path[len("/previews/"):]))
-            filepath = os.path.join(PREVIEW_DIR, filename)
-            if os.path.exists(filepath):
-                with open(filepath, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            else:
-                self.send_response(404)
-                self.end_headers()
-            return
-
-        html = render_page()
+        html = render_dashboard()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         body = html.encode()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-
-    def do_POST(self):
-        if self.path == "/configure":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode() if length else ""
-            fields = {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
-            with config_lock:
-                CONFIG["base_username"] = fields.get("base_username", "").strip().lstrip("@")
-                CONFIG["reaction_username"] = fields.get("reaction_username", "").strip().lstrip("@")
-            log(f"Handles updated -> base=@{CONFIG['base_username']}, reaction=@{CONFIG['reaction_username']}")
-        
-        elif self.path == "/upload-intro":
-            self.handle_file_upload("intro")
-        
-        elif self.path == "/upload-outro":
-            self.handle_file_upload("outro")
-        
-        elif self.path == "/delete-intro":
-            if os.path.exists(INTRO_FILE):
-                os.remove(INTRO_FILE)
-                log("Intro video deleted")
-                status("🗑️ Intro deleted")
-        
-        elif self.path == "/delete-outro":
-            if os.path.exists(OUTRO_FILE):
-                os.remove(OUTRO_FILE)
-                log("Outro video deleted")
-                status("🗑️ Outro deleted")
-        
-        elif self.path == "/generate":
-            log("Manual generate triggered.")
-            threading.Thread(target=run_pipeline, daemon=True).start()
-
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def handle_file_upload(self, file_type):
-        """Handle intro/outro file uploads"""
-        content_type = self.headers.get("Content-Type", "")
-        if "multipart/form-data" not in content_type:
-            return
-        
-        # Parse multipart form data
-        boundary = content_type.split("boundary=")[1].encode()
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        
-        # Extract file content (simplified parsing)
-        try:
-            parts = body.split(b"--" + boundary)
-            for part in parts:
-                if b"Content-Disposition" in part:
-                    # Extract filename and file content
-                    if f'name="{file_type}_video"' in part.decode("utf-8", errors="ignore"):
-                        # Find the actual file data
-                        file_data_start = part.find(b"\r\n\r\n") + 4
-                        file_data_end = part.rfind(b"\r\n")
-                        file_data = part[file_data_start:file_data_end]
-                        
-                        if len(file_data) > 1000:  # Sanity check
-                            target_file = INTRO_FILE if file_type == "intro" else OUTRO_FILE
-                            with open(target_file, "wb") as f:
-                                f.write(file_data)
-                            log(f"{file_type.capitalize()} file uploaded ({len(file_data)/1_000_000:.1f}MB)")
-                            status(f"✅ {file_type.capitalize()} uploaded successfully")
-                        break
-        except Exception as e:
-            log(f"Upload error: {e}")
-            status(f"❌ Upload failed: {e}")
-
+    
     def log_message(self, *args):
         pass
-
 
 def start_server():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    if TIKTOK_COOKIES_FILE:
-        if os.path.exists(TIKTOK_COOKIES_FILE):
-            log(f"Cookies file found at '{TIKTOK_COOKIES_FILE}'.")
-        else:
-            log(f"WARNING: TIKTOK_COOKIES_FILE set to '{TIKTOK_COOKIES_FILE}' but missing.")
-    else:
-        log("WARNING: No TIKTOK_COOKIES_FILE set - requests are unauthenticated and more likely blocked.")
-
-    if not GROQ_API_KEY:
-        log("WARNING: No GROQ_API_KEY set - captions/hashtags will use a generic fallback.")
-
     threading.Thread(target=start_server, daemon=True).start()
-    log("UGC reaction ad bot started. Set your two TikTok handles on the dashboard, then click Generate.")
+    threading.Thread(target=monitoring_loop, daemon=True).start()
+    
+    log("TikTok Repost Bot started")
+    log(f"Monitoring: {TIKTOK_ACCOUNT}")
+    log(f"Posting to: Instagram, Facebook, Snapchat, YouTube")
+    
     while True:
         time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
