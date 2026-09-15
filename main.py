@@ -1,474 +1,852 @@
 import os
 import time
 import json
-import re
-import requests
-import threading
 import subprocess
 import tempfile
-from datetime import datetime
+import threading
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
-from urllib.parse import quote
 
-# API Keys & Credentials
-TIKTOK_ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "@iconspage1")
-INSTAGRAM_ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
-INSTAGRAM_BUSINESS_ACCOUNT_ID = os.environ.get("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
-FACEBOOK_ACCESS_TOKEN = os.environ.get("FACEBOOK_ACCESS_TOKEN", "")
-FACEBOOK_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "")
-SNAPCHAT_ACCESS_TOKEN = os.environ.get("SNAPCHAT_ACCESS_TOKEN", "")
-SNAPCHAT_PIXEL_ID = os.environ.get("SNAPCHAT_PIXEL_ID", "")
-YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
-YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
-YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
-YOUTUBE_CHANNEL_ID = os.environ.get("YOUTUBE_CHANNEL_ID", "")  # jason_animation channel
-
-# Polling interval (check TikTok every N seconds)
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # 5 minutes
+import yt_dlp
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 WORK_DIR = tempfile.gettempdir()
-HISTORY_FILE = "posted_tiktoks.txt"  # Track which TikToks we've already posted
+HISTORY_FILE = "posted_history.json"
+UPLOAD_LIMIT_FILE = "upload_limits.json"  # Track when channels hit the limit
 
-pipeline_log = ["TikTok repost bot ready. Monitoring @iconspage1..."]
+TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
+MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))
+MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", "1.0"))
+POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "5"))
+LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "5"))
+STARTUP_WAIT_HOURS = float(os.environ.get("STARTUP_WAIT_HOURS", "0.05"))
+
+_seed_usernames = [
+    u.strip().lstrip("@") for u in os.environ.get("TIKTOK_USERNAMES", "").split(",") if u.strip()
+]
+
+# ---------------------------------------------------------------------------
+# Two logging tiers:
+#   log()    -> full, verbose, technical detail. Goes to stdout only, which
+#               is what shows up in Railway's deployment logs. Not shown on
+#               the website.
+#   status() -> short, human-readable milestones for the website's Activity
+#               feed (found video / cropping / uploading / done, with links).
+# ---------------------------------------------------------------------------
 log_lock = threading.Lock()
+status_lock = threading.Lock()
+status_feed = []  # what the website shows
+
 
 def log(msg):
+    """Verbose/technical log line. Printed to stdout for Railway logs only."""
     print(msg, flush=True)
-    with log_lock:
-        pipeline_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-        if len(pipeline_log) > 100:
-            pipeline_log.pop(0)
 
-def get_posted_videos():
-    """Load list of already-posted TikTok video IDs to avoid duplicates."""
-    if not os.path.exists(HISTORY_FILE):
-        return set()
-    with open(HISTORY_FILE) as f:
-        return set(line.strip() for line in f if line.strip())
 
-def mark_as_posted(video_id):
-    """Record that we've posted this video."""
-    with open(HISTORY_FILE, "a") as f:
-        f.write(f"{video_id}\n")
+def status(msg):
+    """Short milestone for the website's Activity feed. Also echoed to stdout
+    so it appears in Railway logs too, just prefixed for clarity."""
+    print(f"[status] {msg}", flush=True)
+    with status_lock:
+        status_feed.append(msg)
+        if len(status_feed) > 60:
+            status_feed.pop(0)
 
-# ============================================================================
-# TikTok Download (using yt-dlp - most reliable)
-# ============================================================================
 
-def download_tiktok_video(video_url):
-    """Download TikTok video at highest quality using yt-dlp.
-    Returns: (video_path, audio_path, title, hashtags)"""
-    try:
-        log(f"  Downloading TikTok video: {video_url}")
-        
-        # Use yt-dlp to get highest quality
-        output_template = os.path.join(WORK_DIR, "tiktok_%(id)s.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "-f", "best[ext=mp4]",  # Highest quality MP4
-            "--write-info-json",
-            "-o", output_template,
-            video_url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            log(f"    yt-dlp error: {result.stderr}")
-            return None, None, None, None
-        
-        # Find the downloaded file
-        video_files = sorted(Path(WORK_DIR).glob("tiktok_*.mp4"))
-        if not video_files:
-            log("    No video file found after download")
-            return None, None, None, None
-        
-        video_path = str(video_files[-1])
-        
-        # Try to extract metadata from info JSON
-        info_path = video_path.replace(".mp4", ".info.json")
-        title, hashtags = "TikTok Video", []
-        
-        if os.path.exists(info_path):
-            with open(info_path) as f:
-                info = json.load(f)
-                title = info.get("title", "TikTok Video")[:100]
-                # Extract hashtags from description
-                desc = info.get("description", "")
-                hashtags = re.findall(r"#\w+", desc)
-        
-        log(f"    Downloaded: {video_path}")
-        log(f"    Title: {title}")
-        log(f"    Hashtags: {', '.join(hashtags)}")
-        
-        return video_path, title, hashtags, info_path
-        
-    except Exception as e:
-        log(f"    Download failed: {e}")
-        return None, None, None, None
+pipeline_state_lock = threading.Lock()
+pipeline_running = False
 
-# ============================================================================
-# Upload Functions
-# ============================================================================
+trigger_event = threading.Event()
+next_run_at = [time.time() + STARTUP_WAIT_HOURS * 3600]
 
-def upload_to_instagram(video_path, title, hashtags):
-    """Upload to Instagram using Meta Graph API."""
-    if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_BUSINESS_ACCOUNT_ID:
-        log("  Skipping Instagram (no credentials)")
-        return False
-    
-    try:
-        log("  Uploading to Instagram...")
-        
-        caption = f"{title}\n\n{' '.join(hashtags)}"
-        
-        # Upload video to Instagram
-        url = f"https://graph.instagram.com/{INSTAGRAM_BUSINESS_ACCOUNT_ID}/media"
-        
-        with open(video_path, "rb") as f:
-            files = {"media_source": f}
-            data = {
-                "caption": caption,
-                "media_type": "VIDEO",
-                "access_token": INSTAGRAM_ACCESS_TOKEN
-            }
-            res = requests.post(url, files=files, data=data, timeout=120)
-        
-        if res.status_code in (200, 201):
-            media_id = res.json().get("id")
-            log(f"    Posted to Instagram (ID: {media_id})")
-            return True
-        else:
-            log(f"    Instagram error {res.status_code}: {res.text[:300]}")
-            return False
-    except Exception as e:
-        log(f"    Instagram upload failed: {e}")
-        return False
 
-def upload_to_facebook(video_path, title, hashtags):
-    """Upload to Facebook using Meta Graph API."""
-    if not FACEBOOK_ACCESS_TOKEN or not FACEBOOK_PAGE_ID:
-        log("  Skipping Facebook (no credentials)")
-        return False
-    
-    try:
-        log("  Uploading to Facebook...")
-        
-        caption = f"{title}\n\n{' '.join(hashtags)}"
-        
-        url = f"https://graph.facebook.com/{FACEBOOK_PAGE_ID}/videos"
-        
-        with open(video_path, "rb") as f:
-            files = {"source": f}
-            data = {
-                "title": title,
-                "description": caption,
-                "access_token": FACEBOOK_ACCESS_TOKEN
-            }
-            res = requests.post(url, files=files, data=data, timeout=120)
-        
-        if res.status_code in (200, 201):
-            video_id = res.json().get("id")
-            log(f"    Posted to Facebook (ID: {video_id})")
-            return True
-        else:
-            log(f"    Facebook error {res.status_code}: {res.text[:300]}")
-            return False
-    except Exception as e:
-        log(f"    Facebook upload failed: {e}")
-        return False
-
-def upload_to_snapchat(video_path, title, hashtags):
-    """Upload to Snapchat using Snapchat Marketing API."""
-    if not SNAPCHAT_ACCESS_TOKEN or not SNAPCHAT_PIXEL_ID:
-        log("  Skipping Snapchat (no credentials)")
-        return False
-    
-    try:
-        log("  Uploading to Snapchat...")
-        
-        caption = f"{title}\n\n{' '.join(hashtags)}"
-        
-        # Snapchat's Media Library API
-        url = "https://adsapi.snapchat.com/v1/media/upload"
-        
-        with open(video_path, "rb") as f:
-            files = {"file": f}
-            headers = {
-                "Authorization": f"Bearer {SNAPCHAT_ACCESS_TOKEN}"
-            }
-            data = {
-                "name": title
-            }
-            res = requests.post(url, files=files, headers=headers, data=data, timeout=120)
-        
-        if res.status_code in (200, 201):
-            media_id = res.json().get("media", {}).get("id")
-            log(f"    Posted to Snapchat (ID: {media_id})")
-            return True
-        else:
-            log(f"    Snapchat error {res.status_code}: {res.text[:300]}")
-            return False
-    except Exception as e:
-        log(f"    Snapchat upload failed: {e}")
-        return False
-
-def upload_to_youtube(video_path, title, hashtags):
-    """Upload to YouTube using Google API."""
-    if not YOUTUBE_REFRESH_TOKEN or not YOUTUBE_CLIENT_ID or not YOUTUBE_CLIENT_SECRET:
-        log("  Skipping YouTube (no credentials)")
-        return False
-    
-    try:
-        log("  Uploading to YouTube...")
-        
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
-        
-        creds = Credentials(
-            token=None,
-            refresh_token=YOUTUBE_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=YOUTUBE_CLIENT_ID,
-            client_secret=YOUTUBE_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/youtube.upload"]
-        )
-        creds.refresh(Request())
-        
-        youtube = build("youtube", "v3", credentials=creds)
-        
-        description = f"{title}\n\n{' '.join(hashtags)}"
-        
-        body = {
-            "snippet": {
-                "title": title[:100],
-                "description": description,
-                "categoryId": "20"  # Shorts category
-            },
-            "status": {
-                "privacyStatus": "public",
-                "selfDeclaredMadeForKids": False
-            }
-        }
-        
-        media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True)
-        req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        
-        response = None
-        while response is None:
-            status, response = req.next_chunk()
-        
-        video_id = response.get("id")
-        log(f"    Posted to YouTube: https://youtube.com/watch?v={video_id}")
-        return True
-        
-    except Exception as e:
-        log(f"    YouTube upload failed: {e}")
-        return False
-
-# ============================================================================
-# TikTok Monitoring
-# ============================================================================
-
-def get_tiktok_video_urls():
-    """Fetch recent videos from TikTok account using web scraping.
-    Returns list of (video_url, video_id) tuples."""
-    try:
-        log(f"Checking TikTok account {TIKTOK_ACCOUNT}...")
-        
-        # Using unofficial TikTok API / scraper
-        # For production, use: https://github.com/davidteather/TikTok-Api
-        # or install: pip install TikTokApi
-        
-        # Fallback: Use yt-dlp to list videos from profile
-        account_url = f"https://www.tiktok.com/{TIKTOK_ACCOUNT}"
-        
-        cmd = [
-            "yt-dlp",
-            "--flat-playlist",
-            "-j",
-            account_url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            log(f"  Error fetching TikTok profile: {result.stderr[:200]}")
-            return []
-        
-        videos = []
-        for line in result.stdout.strip().split("\n"):
-            if line.strip():
-                try:
-                    entry = json.loads(line)
-                    url = entry.get("url") or f"https://www.tiktok.com/@{TIKTOK_ACCOUNT}/video/{entry.get('id')}"
-                    video_id = entry.get("id", "").split("_")[-1]
-                    videos.append((url, video_id))
-                except:
-                    pass
-        
-        log(f"  Found {len(videos)} videos")
-        return videos
-        
-    except Exception as e:
-        log(f"  Error fetching TikTok videos: {e}")
-        return []
-
-def process_video(video_url, video_id):
-    """Download and repost a single TikTok video to all platforms."""
-    log(f"\nProcessing TikTok video {video_id}...")
-    
-    video_path = None
-    try:
-        # Download
-        video_path, title, hashtags, info_path = download_tiktok_video(video_url)
-        if not video_path:
-            return False
-        
-        log(f"  Reposting to all platforms...")
-        
-        # Upload to each platform
-        upload_to_instagram(video_path, title, hashtags)
-        upload_to_facebook(video_path, title, hashtags)
-        upload_to_snapchat(video_path, title, hashtags)
-        upload_to_youtube(video_path, title, hashtags)
-        
-        # Mark as done
-        mark_as_posted(video_id)
-        log(f"  ✓ Completed: {title}")
-        return True
-        
-    except Exception as e:
-        log(f"  Error processing video: {e}")
-        return False
-    finally:
-        # Cleanup
-        for f in [video_path, info_path]:
-            try:
-                if f and os.path.exists(f):
-                    os.remove(f)
-            except:
-                pass
-
-def monitoring_loop():
-    """Main loop: periodically check TikTok and repost new videos."""
-    posted = get_posted_videos()
-    log(f"Loaded history: {len(posted)} videos already posted")
-    
-    while True:
+def load_youtube_accounts():
+    raw = os.environ.get("YOUTUBE_ACCOUNTS_JSON", "")
+    accounts = []
+    if raw:
         try:
-            videos = get_tiktok_video_urls()
-            
-            for url, video_id in videos:
-                if video_id not in posted:
-                    if process_video(url, video_id):
-                        posted.add(video_id)
-            
-            log(f"Waiting {POLL_INTERVAL}s until next check...")
-            time.sleep(POLL_INTERVAL)
-            
-        except Exception as e:
-            log(f"Monitoring loop error: {e}")
-            time.sleep(60)
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                accounts = [a for a in parsed if a.get("id") and a.get("refresh_token")]
+        except json.JSONDecodeError:
+            log("WARNING: YOUTUBE_ACCOUNTS_JSON is not valid JSON - ignoring it.")
 
-# ============================================================================
-# Web Dashboard
-# ============================================================================
+    legacy_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
+    if legacy_token and not any(a["id"] == "default" for a in accounts):
+        accounts.insert(0, {"id": "default", "label": "Default Channel", "refresh_token": legacy_token})
+
+    default_client_id = os.environ.get("YOUTUBE_CLIENT_ID", "")
+    default_client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+
+    for i, acc in enumerate(accounts):
+        suffix = "" if i == 0 else str(i + 1)
+        env_client_id = os.environ.get(f"YOUTUBE_CLIENT_ID{suffix}", "")
+        env_client_secret = os.environ.get(f"YOUTUBE_CLIENT_SECRET{suffix}", "")
+
+        acc["client_id"] = acc.get("client_id") or env_client_id or default_client_id
+        acc["client_secret"] = acc.get("client_secret") or env_client_secret or default_client_secret
+
+    return accounts
+
+
+YOUTUBE_ACCOUNTS = load_youtube_accounts()
+YOUTUBE_ACCOUNTS_BY_ID = {a["id"]: a for a in YOUTUBE_ACCOUNTS}
+
+config_lock = threading.Lock()
+_default_youtube_id = YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else ""
+# "format" per account row: "shorts" (default, vertical as-is) or "landscape"
+# (blurred-pillarbox crop to 16:9, posted as a normal long-form video, no #Shorts tag)
+CONFIG = {
+    "accounts": [{"tiktok": u, "youtube": _default_youtube_id, "format": "shorts"} for u in _seed_usernames]
+}
+
+
+def get_config():
+    with config_lock:
+        return dict(CONFIG)
+
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def load_upload_limits():
+    """Load when each YouTube channel hit upload limit"""
+    if os.path.exists(UPLOAD_LIMIT_FILE):
+        with open(UPLOAD_LIMIT_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_upload_limits(limits):
+    """Save upload limit timestamps"""
+    with open(UPLOAD_LIMIT_FILE, "w") as f:
+        json.dump(limits, f, indent=2)
+
+
+def is_channel_limited(youtube_account_id, limits):
+    """Check if channel is currently in 24-hour cooldown"""
+    if youtube_account_id not in limits:
+        return False
+
+    limit_time = limits[youtube_account_id]
+    current_time = time.time()
+    hours_passed = (current_time - limit_time) / 3600
+
+    if hours_passed < 24:
+        remaining = 24 - hours_passed
+        log(f"  ⏸️  UPLOAD LIMIT ACTIVE - Channel paused for {remaining:.1f} more hours")
+        return True
+    else:
+        # 24 hours passed, reset the limit
+        del limits[youtube_account_id]
+        save_upload_limits(limits)
+        return False
+
+
+def get_posted_ids(history, history_key):
+    val = history.get(history_key, [])
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, list):
+        return val
+    return []
+
+
+def get_google_creds(scopes, refresh_token, client_id, client_secret):
+    return Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+    )
+
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>TikTok Repost Bot</title>
+<title>TikTok -> YouTube Bot</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { font-family: -apple-system, sans-serif; background: #0b0b10; color: #eaeaf2; padding: 20px; }
-  .wrap { max-width: 900px; margin: 0 auto; }
-  h1 { margin-top: 0; }
-  .card { background: #14141c; border: 1px solid #26263a; border-radius: 12px; padding: 20px; margin: 20px 0; }
-  .log { background: #08080d; border: 1px solid #26263a; border-radius: 8px; padding: 12px; 
-         font-family: monospace; font-size: 12px; color: #8fe3a8; max-height: 400px; 
-         overflow-y: auto; white-space: pre-wrap; line-height: 1.5; }
-  .status { color: #35d488; font-weight: bold; }
-  .error { color: #ff3b5c; }
+  :root {
+    --bg: #0b0b10; --panel: #14141c; --panel-2: #1b1b26; --border: #26263a;
+    --text: #eaeaf2; --muted: #8a8aa0; --accent: #ff3b5c; --accent-2: #7c5cff; --ok: #35d488;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,0.18), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(255,59,92,0.14), transparent 55%), var(--bg);
+    color: var(--text); padding: 32px 20px 60px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  .logo { width: 42px; height: 42px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; flex-shrink: 0; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .badge { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
+  .badge b { color: var(--text); }
+  .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
+  .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
+  label:first-of-type { margin-top: 0; }
+  input[type=text], select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
+  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
+  .account-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .account-row input[type=text] { flex: 1; min-width: 0; }
+  .account-row select { flex: 1; min-width: 0; }
+  .account-row select.fmt { flex: 0 0 118px; }
+  .account-row button { width: auto; margin-top: 0; padding: 8px 12px; }
+  button { width: 100%; margin-top: 18px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff; border: none; padding: 13px; border-radius: 10px; font-size: 14.5px; font-weight: 600;
+    cursor: pointer; letter-spacing: 0.01em; }
+  button:hover { filter: brightness(1.08); }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  .feed { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow-y: auto; }
+  .feed-item { background: #08080d; border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-size: 13px; line-height: 1.5; }
+  .feed-item a { color: var(--accent-2); text-decoration: none; }
+  .feed-item a:hover { text-decoration: underline; }
+  .feed-empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🎵 TikTok → All Platforms Repost Bot</h1>
-  
-  <div class="card">
-    <h2>Status</h2>
-    <p><span class="status">✓ Monitoring:</span> @@ACCOUNT@@</p>
-    <p>Polling interval: @@INTERVAL@@s | Posted: @@POSTED_COUNT@@</p>
+  <header>
+    <div class="logo">TT&gt;YT</div>
+    <div>
+      <h1>TikTok -&gt; YouTube Bot</h1>
+      <div class="sub">Watches TikTok accounts, reposts new videos to YouTube automatically</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Status</h2>
+      <div class="badges">
+        <div class="badge">Posted <b>@@DONE_COUNT@@</b></div>
+        <div class="badge">Checking every <b>@@INTERVAL@@h</b></div>
+        <div class="badge @@YT_WARN_CLASS@@">YouTube channels <b>@@YT_COUNT@@</b></div>
+        <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
+      </div>
+      <h2 style="margin-top:20px;">Activity</h2>
+      <div class="feed">@@FEED_CONTENT@@</div>
+      <form method="POST" action="/trigger">
+        <button type="submit">Check All Now</button>
+      </form>
+      <div class="hint">Checks every monitored account immediately instead of waiting for the next scheduled check. Full technical logs are in your Railway deployment logs, not here.</div>
+    </div>
+
+    <div class="card">
+      <h2>Monitored Accounts</h2>
+      <form method="POST" action="/configure">
+        <label>Each row: TikTok account, the YouTube channel it posts to, and the output format.</label>
+        <div id="accountRows">
+@@ACCOUNT_ROWS@@
+        </div>
+        <button type="button" class="secondary" onclick="addRow()">+ Add Account</button>
+        <button type="submit">Save Accounts</button>
+      </form>
+      <div class="hint">
+        Every check cycle, the bot looks at each TikTok account's last @@LOOKBACK@@ videos. Any
+        that aren't already posted for that profile get queued up, oldest first, one upload per
+        cycle, to the YouTube channel selected for that row - so nothing gets silently skipped
+        even if several videos land between checks.
+        <br><b>Shorts</b> posts the vertical video as-is with a #Shorts tag.
+        <b>Landscape</b> crops it to 16:9 (blurred pillarbox, nothing is cut off) and posts it as
+        a normal long-form video with no #Shorts tag.
+        @@YT_HINT@@
+      </div>
+    </div>
   </div>
-  
-  <div class="card">
-    <h2>Platforms Connected</h2>
-    <p>✓ Instagram: @@INSTAGRAM@@</p>
-    <p>✓ Facebook: @@FACEBOOK@@</p>
-    <p>✓ Snapchat: @@SNAPCHAT@@</p>
-    <p>✓ YouTube: @@YOUTUBE@@</p>
-  </div>
-  
-  <div class="card">
-    <h2>Activity Log</h2>
-    <div class="log">@@LOG@@</div>
-  </div>
+
+  <footer>First check runs @@STARTUP_WAIT@@h after boot &middot; next run in @@NEXT_RUN_IN@@</footer>
 </div>
+
+<script>
+let rowIndex = @@ROW_COUNT@@;
+function addRow() {
+  const div = document.createElement('div');
+  div.className = 'account-row';
+  div.innerHTML = `
+    <input type="text" name="tiktok_${rowIndex}" placeholder="tiktok username">
+    <select name="youtube_${rowIndex}">@@YOUTUBE_OPTIONS_JS@@</select>
+    <select name="format_${rowIndex}" class="fmt">
+      <option value="shorts">Shorts</option>
+      <option value="landscape">Landscape</option>
+    </select>
+    <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  document.getElementById('accountRows').appendChild(div);
+  rowIndex++;
+}
+</script>
 </body>
 </html>"""
 
-def render_dashboard():
-    with log_lock:
-        log_text = "\n".join(pipeline_log[-50:])
-    
-    posted = len(get_posted_videos())
-    
+
+def format_countdown(target_epoch):
+    remaining = int(target_epoch - time.time())
+    if remaining <= 0:
+        return "any moment"
+    h, rem = divmod(remaining, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def esc(s):
+    return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def youtube_options_html(selected=""):
+    if not YOUTUBE_ACCOUNTS:
+        return '<option value="">No YouTube accounts configured</option>'
+    opts = []
+    for acc in YOUTUBE_ACCOUNTS:
+        sel = " selected" if acc["id"] == selected else ""
+        opts.append(f'<option value="{esc(acc["id"])}"{sel}>{esc(acc["label"])}</option>')
+    return "\n".join(opts)
+
+
+def format_options_html(selected="shorts"):
+    opts = []
+    for value, label in (("shorts", "Shorts"), ("landscape", "Landscape")):
+        sel = " selected" if value == selected else ""
+        opts.append(f'<option value="{value}"{sel}>{label}</option>')
+    return "\n".join(opts)
+
+
+def render_account_rows(accounts):
+    rows_source = accounts if accounts else [{"tiktok": "", "youtube": "", "format": "shorts"}]
+    rows = []
+    for i, acc in enumerate(rows_source):
+        rows.append(
+            f'<div class="account-row">\n'
+            f'  <input type="text" name="tiktok_{i}" value="{esc(acc.get("tiktok", ""))}" placeholder="tiktok username">\n'
+            f'  <select name="youtube_{i}">{youtube_options_html(acc.get("youtube", ""))}</select>\n'
+            f'  <select name="format_{i}" class="fmt">{format_options_html(acc.get("format", "shorts"))}</select>\n'
+            f'  <button type="button" class="secondary" onclick="this.parentElement.remove()">&times;</button>\n'
+            f'</div>'
+        )
+    return "\n".join(rows), len(rows_source)
+
+
+def render_feed_html():
+    with status_lock:
+        items = list(status_feed[-25:])
+    if not items:
+        return '<div class="feed-empty">Nothing yet - click "Check All Now" or wait for the next scheduled check.</div>'
+    # newest first
+    return "\n".join(f'<div class="feed-item">{item}</div>' for item in reversed(items))
+
+
+def render_page():
+    history = load_history()
+    done_count = sum(len(get_posted_ids(history, k)) for k in history)
+    with pipeline_state_lock:
+        running = pipeline_running
+
+    cfg = get_config()
+    rows_html, row_count = render_account_rows(cfg["accounts"])
+
+    yt_hint = ""
+    if not YOUTUBE_ACCOUNTS:
+        yt_hint = " No YouTube accounts are configured yet - set YOUTUBE_ACCOUNTS_JSON (or the legacy YOUTUBE_REFRESH_TOKEN) before saving accounts."
+
     html = PAGE_TEMPLATE
-    html = html.replace("@@ACCOUNT@@", TIKTOK_ACCOUNT)
-    html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL))
-    html = html.replace("@@POSTED_COUNT@@", str(posted))
-    html = html.replace("@@INSTAGRAM@@", "Configured" if INSTAGRAM_ACCESS_TOKEN else "Not set up")
-    html = html.replace("@@FACEBOOK@@", "Configured" if FACEBOOK_ACCESS_TOKEN else "Not set up")
-    html = html.replace("@@SNAPCHAT@@", "Configured" if SNAPCHAT_ACCESS_TOKEN else "Not set up")
-    html = html.replace("@@YOUTUBE@@", "Configured" if YOUTUBE_REFRESH_TOKEN else "Not set up")
-    html = html.replace("@@LOG@@", log_text)
-    
+    html = html.replace("@@DONE_COUNT@@", str(done_count))
+    html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL_HOURS))
+    html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
+    html = html.replace("@@RUNNING_TEXT@@", "Checking now" if running else "Idle")
+    html = html.replace("@@YT_COUNT@@", str(len(YOUTUBE_ACCOUNTS)))
+    html = html.replace("@@YT_WARN_CLASS@@", "warn" if not YOUTUBE_ACCOUNTS else "")
+    html = html.replace("@@YT_HINT@@", yt_hint)
+    html = html.replace("@@FEED_CONTENT@@", render_feed_html())
+    html = html.replace("@@ACCOUNT_ROWS@@", rows_html)
+    html = html.replace("@@ROW_COUNT@@", str(row_count))
+    html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
+    html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
+    html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
+    html = html.replace("@@LOOKBACK@@", str(LOOKBACK_COUNT))
     return html
+
+
+def parse_accounts_from_form(fields_multi):
+    indices = set()
+    for key in fields_multi:
+        if key.startswith("tiktok_"):
+            suffix = key[len("tiktok_"):]
+            if suffix.isdigit():
+                indices.add(int(suffix))
+
+    accounts = []
+    for i in sorted(indices):
+        tiktok = fields_multi.get(f"tiktok_{i}", [""])[0].strip().lstrip("@")
+        youtube = fields_multi.get(f"youtube_{i}", [""])[0].strip()
+        fmt = fields_multi.get(f"format_{i}", ["shorts"])[0].strip()
+        if fmt not in ("shorts", "landscape"):
+            fmt = "shorts"
+        if not tiktok:
+            continue
+        if not youtube and YOUTUBE_ACCOUNTS:
+            youtube = YOUTUBE_ACCOUNTS[0]["id"]
+        accounts.append({"tiktok": tiktok, "youtube": youtube, "format": fmt})
+    return accounts
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        html = render_dashboard()
+        html = render_page()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         body = html.encode()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-    
+
+    def do_POST(self):
+        if self.path == "/configure":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode() if length else ""
+            fields_multi = urllib.parse.parse_qs(body)
+            accounts = parse_accounts_from_form(fields_multi)
+            with config_lock:
+                CONFIG["accounts"] = accounts
+            summary = ", ".join(
+                f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])} ({a['format']})"
+                for a in accounts
+            )
+            log(f"Accounts updated -> {summary if accounts else '(none)'}")
+        elif self.path == "/trigger":
+            log("Manual trigger received - checking all accounts now.")
+            status("🔁 Manual check triggered.")
+            trigger_event.set()
+
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def log_message(self, *args):
         pass
+
 
 def start_server():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ============================================================================
-# Main
-# ============================================================================
+
+def get_recent_tiktok_videos(username, limit=5):
+    profile_url = f"https://www.tiktok.com/@{username}"
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "playlistend": limit,
+    }
+    if TIKTOK_COOKIES_FILE:
+        ydl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(profile_url, download=False)
+
+    entries = info.get("entries") if info else None
+    if not entries:
+        return []
+
+    videos = []
+    for entry in entries:
+        video_id = entry.get("id")
+        if not video_id:
+            continue
+        videos.append({
+            "id": video_id,
+            "title": entry.get("title") or f"TikTok video {video_id}",
+            "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{video_id}",
+        })
+    return videos
+
+
+def probe_duration_seconds(filepath):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def download_tiktok_video(video_url, filepath):
+    log(f"  Fetching: {video_url}")
+    dl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": filepath,
+        "format": "mp4/best",
+    }
+    if TIKTOK_COOKIES_FILE:
+        dl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
+    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+        ydl.download([video_url])
+
+    if not os.path.exists(filepath):
+        raise RuntimeError("Download reported success but no file was written")
+
+    size = os.path.getsize(filepath)
+    if size < MIN_VALID_FILE_BYTES:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"Downloaded file too small ({size} bytes) - likely blocked by TikTok "
+            f"or got an error response instead of the real video. "
+            f"Check TIKTOK_COOKIES_FILE is set to a fresh, TikTok-only cookies.txt."
+        )
+
+    duration = probe_duration_seconds(filepath)
+    if duration is None:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"File downloaded ({size / 1_000_000:.1f} MB) but ffprobe couldn't read it "
+            f"as a valid video - it's corrupt or not actually a video file. "
+            f"Likely a blocked/error response from TikTok, not a real download."
+        )
+    if duration < MIN_VALID_DURATION_SECONDS:
+        os.remove(filepath)
+        raise RuntimeError(
+            f"File downloaded ({size / 1_000_000:.1f} MB) but duration is only "
+            f"{duration:.2f}s - too short to be real, likely corrupt/blocked."
+        )
+
+    log(f"  Download OK ({size / 1_000_000:.1f} MB, {duration:.1f}s)")
+
+
+def _clean_ffmpeg_stderr(stderr, max_lines=40):
+    """Strip out the high-volume, low-signal noise (progress ticks, codec
+    banner) from ffmpeg's stderr so the real error line is actually visible,
+    instead of getting pushed out by a character-count tail truncation."""
+    noisy_prefixes = ("frame=", "size=")
+    lines = [
+        l for l in stderr.splitlines()
+        if l.strip() and not l.strip().startswith(noisy_prefixes)
+    ]
+    return "\n".join(lines[-max_lines:]) if lines else stderr[-2000:]
+
+
+def crop_to_landscape(input_path, output_path):
+    """
+    Convert a vertical (9:16) video to landscape (16:9) using a blurred
+    pillarbox: the full original frame is kept, centered, with a blurred
+    zoomed copy of itself filling the left/right bars. Nothing is cropped
+    out - unlike a plain center-crop, which cuts off the top/bottom of the
+    frame (heads, captions, hands) and only keeps a thin middle strip.
+
+    setsar=1 is applied after every scale/overlay stage. Without it, the
+    original vertical clip's sample-aspect-ratio metadata can survive into
+    the background and foreground branches with different values, which
+    confuses `overlay` and/or leaves the final file's display-aspect-ratio
+    tagged incorrectly (e.g. still reporting as portrait even though the
+    pixel dimensions are 1920x1080) - this was the likely cause of crops
+    silently failing or producing a mis-tagged "landscape" file.
+    """
+    vf = (
+        "[0:v]scale=480:270,boxblur=10:2,scale=1920:1080,setsar=1[bg];"
+        "[0:v]scale=-2:1080,setsar=1[fg];"
+        "[bg][fg]overlay=(W-w)/2:0,setsar=1"
+    )
+    # -threads caps how many encoder threads libx264 spins up. Left unset,
+    # libx264 sizes itself off the number of CPUs it can see (34 threads in
+    # our logs), and each thread carries its own lookahead buffer - on a
+    # memory-limited container that can be enough to trip the OS's
+    # out-of-memory killer mid-encode, which shows up as the process dying
+    # with no real ffmpeg error message at all (just a SIGKILL). Capping
+    # threads keeps memory use predictable regardless of how many CPUs the
+    # container reports. Override with FFMPEG_THREADS if needed.
+    ffmpeg_threads = os.environ.get("FFMPEG_THREADS", "2")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", vf,
+        "-threads", ffmpeg_threads,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", ffmpeg_threads,
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if result.returncode != 0 or not os.path.exists(output_path):
+        if result.returncode is not None and result.returncode < 0:
+            # Negative returncode from subprocess means the process was
+            # killed by a signal (POSIX: returncode == -signum), not that
+            # ffmpeg itself reported an error. -9 (SIGKILL) on a hosted
+            # container almost always means it ran out of memory.
+            signum = -result.returncode
+            reason = (
+                f"process was killed by signal {signum}"
+                + (" (SIGKILL - almost always an out-of-memory kill on the host container)"
+                   if signum == 9 else "")
+            )
+            raise RuntimeError(
+                f"ffmpeg crop failed - {reason}. Try lowering FFMPEG_THREADS "
+                f"(currently {ffmpeg_threads}) or check the container's memory limit.\n"
+                f"Last ffmpeg output before it died:\n{_clean_ffmpeg_stderr(result.stderr)}"
+            )
+        raise RuntimeError(
+            f"ffmpeg crop failed (exit code {result.returncode}):\n"
+            f"{_clean_ffmpeg_stderr(result.stderr)}"
+        )
+    log(f"  Cropped to landscape ({os.path.getsize(output_path) / 1_000_000:.1f} MB)")
+
+
+def upload_to_youtube(file_path, title, description, youtube_account_id, limits):
+    account = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_account_id)
+    if not account:
+        log(f"  Upload failed: no YouTube account configured for id '{youtube_account_id}'")
+        return None
+
+    client_id = account.get("client_id")
+    client_secret = account.get("client_secret")
+    if not client_id or not client_secret:
+        log(f"  Upload failed: no OAuth client_id/client_secret resolved for "
+            f"'{account['label']}'. Set YOUTUBE_CLIENT_ID/SECRET (default) or a "
+            f"numbered pair like YOUTUBE_CLIENT_ID2/YOUTUBE_CLIENT_SECRET2 for "
+            f"this account's position in YOUTUBE_ACCOUNTS_JSON.")
+        return None
+
+    log(f"  Uploading to YouTube ({account['label']})...")
+    try:
+        creds = get_google_creds(
+            ["https://www.googleapis.com/auth/youtube.upload"],
+            account["refresh_token"],
+            client_id,
+            client_secret,
+        )
+        creds.refresh(Request())
+        youtube = build("youtube", "v3", credentials=creds)
+
+        body = {
+            "snippet": {"title": title[:100], "description": description, "categoryId": "24"},
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+        }
+        media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+        req = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
+        response = None
+        while response is None:
+            status_chunk, response = req.next_chunk()
+        vid = response.get("id")
+        log(f"  Live -> https://youtube.com/watch?v={vid}")
+        return vid
+    except Exception as e:
+        error_str = str(e)
+
+        # Check if it's upload limit error
+        if "uploadLimitExceeded" in error_str or "exceeded the number of videos" in error_str:
+            log(f"  ⏸️  UPLOAD LIMIT HIT! Setting 24-hour cooldown for this channel")
+            status(f"⏸️ YouTube upload limit hit on <b>{esc(account['label'])}</b> - paused 24h.")
+            limits[youtube_account_id] = time.time()
+            save_upload_limits(limits)
+        else:
+            log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
+            status(f"❌ Upload to <b>{esc(account['label'])}</b> failed: {esc(type(e).__name__)}")
+
+        return None
+
+
+def check_account(account, history, limits):
+    username = account["tiktok"]
+    youtube_id = account.get("youtube") or (YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else "")
+    video_format = account.get("format", "shorts")
+    yt_label = YOUTUBE_ACCOUNTS_BY_ID.get(youtube_id, {}).get("label", youtube_id or "no channel set")
+    history_key = f"{username}::{youtube_id}"
+
+    log(f"Checking @{username} (-> {yt_label}, {video_format})...")
+
+    # Check if channel is in cooldown
+    if is_channel_limited(youtube_id, limits):
+        return
+
+    if not youtube_id or youtube_id not in YOUTUBE_ACCOUNTS_BY_ID:
+        log(f"  Skipping: no valid YouTube channel selected for this profile.")
+        return
+
+    try:
+        videos = get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT)
+    except Exception as e:
+        log(f"  Failed to check TikTok: {e}")
+        status(f"❌ Couldn't check @{esc(username)} on TikTok: {esc(type(e).__name__)}")
+        return
+
+    if not videos:
+        log("  No videos found on this profile.")
+        return
+
+    posted_ids = get_posted_ids(history, history_key)
+
+    unposted = [v for v in videos if v["id"] not in posted_ids]
+    if not unposted:
+        log("  No new video since last check.")
+        return
+
+    if len(unposted) > 1:
+        log(f"  {len(unposted)} unposted videos found within the last {len(videos)} - "
+            f"posting the oldest of them now, the rest next cycle(s).")
+
+    video = unposted[-1]
+    tiktok_link = f'<a href="{esc(video["url"])}" target="_blank">TikTok source</a>'
+
+    log(f"  New video found ({video['id']}) - downloading...")
+    status(f"📥 Found new video from @{esc(username)} - {tiktok_link}")
+
+    filepath = os.path.join(WORK_DIR, f"{video['id']}.mp4")
+    try:
+        download_tiktok_video(video["url"], filepath)
+    except Exception as e:
+        log(f"  Download failed: {e}")
+        status(f"❌ Download failed for @{esc(username)}'s video: {esc(type(e).__name__)}")
+        return
+
+    upload_path = filepath
+    landscape_path = None
+    if video_format == "landscape":
+        status(f"🎬 Cropping @{esc(username)}'s video to landscape...")
+        landscape_path = os.path.join(WORK_DIR, f"{video['id']}_landscape.mp4")
+        try:
+            crop_to_landscape(filepath, landscape_path)
+            upload_path = landscape_path
+        except Exception as e:
+            log(f"  Crop failed, falling back to vertical upload: {e}")
+            status(f"⚠️ Crop failed - posting @{esc(username)}'s video as vertical instead.")
+            upload_path = filepath
+            landscape_path = None
+
+    if video_format == "landscape" and upload_path == landscape_path:
+        title = video["title"][:100]
+    else:
+        title = video["title"][:95] + " #Shorts"
+    description = f"{video['title']}\n\nOriginally posted on TikTok by @{username}\n{video['url']}"
+
+    status(f"⬆️ Uploading to YouTube ({esc(yt_label)})...")
+    vid = upload_to_youtube(upload_path, title, description, youtube_id, limits)
+
+    for p in (filepath, landscape_path):
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    if vid:
+        posted_ids.append(video["id"])
+        history[history_key] = posted_ids[-50:]
+        save_history(history)
+        log(f"  Done: @{username} -> {video['id']} posted to {yt_label}.")
+        yt_link = f'<a href="https://youtube.com/watch?v={esc(vid)}" target="_blank">https://youtube.com/watch?v={esc(vid)}</a>'
+        status(f"✅ Done! @{esc(username)} -> {esc(yt_label)}: {yt_link} ({tiktok_link})")
+
+
+def run_pipeline():
+    global pipeline_running
+    with pipeline_state_lock:
+        if pipeline_running:
+            log("Check already running - ignoring this trigger.")
+            return
+        pipeline_running = True
+
+    try:
+        cfg = get_config()
+        accounts = cfg["accounts"]
+        if not accounts:
+            log("No accounts configured yet - add accounts on the dashboard.")
+            return
+        if not YOUTUBE_ACCOUNTS:
+            log("No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON before running.")
+            return
+        history = load_history()
+        limits = load_upload_limits()
+        for account in accounts:
+            check_account(account, history, limits)
+        log("Check cycle complete.")
+    except Exception as e:
+        log(f"Pipeline error: {e}")
+    finally:
+        with pipeline_state_lock:
+            pipeline_running = False
+
+
+def autopilot_loop():
+    wait_seconds = STARTUP_WAIT_HOURS * 3600
+    log(f"Startup window: waiting {STARTUP_WAIT_HOURS}h before the first check. "
+        f"Visit the dashboard to add TikTok accounts, or click 'Check All Now' to skip the wait.")
+    while True:
+        next_run_at[0] = time.time() + wait_seconds
+        trigger_event.wait(timeout=wait_seconds)
+        trigger_event.clear()
+        run_pipeline()
+        wait_seconds = POLL_INTERVAL_HOURS * 3600
+        log(f"Sleeping {POLL_INTERVAL_HOURS}h until next check (or trigger manually anytime)...")
+
 
 def main():
+    if TIKTOK_COOKIES_FILE:
+        if os.path.exists(TIKTOK_COOKIES_FILE):
+            n_lines = sum(1 for _ in open(TIKTOK_COOKIES_FILE))
+            log(f"Cookies file found at '{TIKTOK_COOKIES_FILE}' ({n_lines} lines).")
+        else:
+            log(f"WARNING: TIKTOK_COOKIES_FILE is set to '{TIKTOK_COOKIES_FILE}' but that "
+                f"path doesn't exist - cookies will NOT be used. Check the path/env var.")
+    else:
+        log("WARNING: No TIKTOK_COOKIES_FILE set - requests are unauthenticated and "
+            "much more likely to get blocked by TikTok.")
+
+    if YOUTUBE_ACCOUNTS:
+        for acc in YOUTUBE_ACCOUNTS:
+            has_client = bool(acc.get("client_id") and acc.get("client_secret"))
+            client_note = "OK" if has_client else "MISSING client_id/client_secret!"
+            log(f"YouTube account loaded: {acc['label']} (id={acc['id']}) - OAuth client: {client_note}")
+    else:
+        log("WARNING: No YouTube accounts configured - set YOUTUBE_ACCOUNTS_JSON "
+            "(or the legacy YOUTUBE_REFRESH_TOKEN) or uploads will fail.")
+
     threading.Thread(target=start_server, daemon=True).start()
-    threading.Thread(target=monitoring_loop, daemon=True).start()
-    
-    log("TikTok Repost Bot started")
-    log(f"Monitoring: {TIKTOK_ACCOUNT}")
-    log(f"Posting to: Instagram, Facebook, Snapchat, YouTube")
-    
+    threading.Thread(target=autopilot_loop, daemon=True).start()
+    log("Bot started.")
     while True:
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
