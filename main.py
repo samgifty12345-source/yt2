@@ -25,6 +25,7 @@ DEFAULT_ACCOUNTS = [
     {"tiktok": "movierecap.wow", "youtube": "default", "format": "shorts"},
     {"tiktok": "happylittlegc4", "youtube": "jasonranks", "format": "shorts"},
     {"tiktok": "lightofdeendaily0", "youtube": "jasonranks", "format": "shorts"},
+    {"tiktok": "sky_raiding", "youtube": "jasonfunny", "format": "shorts"},
 ]
 
 # Videos that are already posted, so they never get posted twice after a
