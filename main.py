@@ -13,16 +13,56 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# ===========================================================================
+# EDIT THESE TWO BLOCKS IN THE CODE (no Railway changes needed)
+# ===========================================================================
+
+# Accounts the bot monitors. These live in the code, so they survive every
+# redeploy. "youtube" is the channel id from YOUTUBE_ACCOUNTS_JSON
+# ("default" = jason_animation, "channel2" = Jason Shorts, "channel3" = dimoplet).
+# "format" is "shorts" or "landscape".
+DEFAULT_ACCOUNTS = [
+    {"tiktok": "movierecap.wow", "youtube": "default", "format": "shorts"},
+]
+
+# Videos that are already posted, so they never get posted twice after a
+# redeploy. Key is "tiktok_username::youtube_channel_id", value is a list of
+# TikTok video IDs. Add IDs here (copy them from the Posted History box on the
+# dashboard) to make them permanent.
+SEED_HISTORY = {
+    "movierecap.wow::default": ["7691393249432309010"],
+}
+
+# ===========================================================================
+
+
+def _pick_data_dir():
+    """Use a persistent volume if one exists (/data or DATA_DIR), otherwise
+    fall back to the folder the script runs from."""
+    for d in (os.environ.get("DATA_DIR"), "/data"):
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DATA_DIR = _pick_data_dir()
 WORK_DIR = tempfile.gettempdir()
-HISTORY_FILE = "posted_history.json"
-UPLOAD_LIMIT_FILE = "upload_limits.json"  # Track when channels hit the limit
+HISTORY_FILE = os.path.join(DATA_DIR, "posted_history.json")
+UPLOAD_LIMIT_FILE = os.path.join(DATA_DIR, "upload_limits.json")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE", "")
 MIN_VALID_FILE_BYTES = int(os.environ.get("MIN_VALID_FILE_BYTES", "300000"))
 MIN_VALID_DURATION_SECONDS = float(os.environ.get("MIN_VALID_DURATION_SECONDS", "1.0"))
-POLL_INTERVAL_HOURS = float(os.environ.get("POLL_INTERVAL_HOURS", "5"))
-LOOKBACK_COUNT = int(os.environ.get("LOOKBACK_COUNT", "5"))
+
+# One upload per account per cycle. 2 posts a day = a cycle every 12 hours.
+POSTS_PER_DAY = 2
+POLL_INTERVAL_HOURS = 24.0 / POSTS_PER_DAY
+# 0 = read the account's entire video list (needed to start from the oldest).
+LOOKBACK_COUNT = 0
 STARTUP_WAIT_HOURS = float(os.environ.get("STARTUP_WAIT_HOURS", "0.05"))
+# If a video fails to download this many times, skip it so it can't block the queue.
+MAX_DOWNLOAD_FAILS = 3
 
 _seed_usernames = [
     u.strip().lstrip("@") for u in os.environ.get("TIKTOK_USERNAMES", "").split(",") if u.strip()
@@ -62,6 +102,11 @@ pipeline_running = False
 trigger_event = threading.Event()
 next_run_at = [time.time() + STARTUP_WAIT_HOURS * 3600]
 
+# In-memory only (cleared on restart/redeploy, which is what you want after
+# fixing a token or a bad video).
+failed_downloads = {}   # video_id -> number of failed download attempts
+auth_broken = set()     # youtube channel ids whose refresh token was rejected
+
 
 def load_youtube_accounts():
     raw = os.environ.get("YOUTUBE_ACCOUNTS_JSON", "")
@@ -97,11 +142,46 @@ YOUTUBE_ACCOUNTS_BY_ID = {a["id"]: a for a in YOUTUBE_ACCOUNTS}
 
 config_lock = threading.Lock()
 _default_youtube_id = YOUTUBE_ACCOUNTS[0]["id"] if YOUTUBE_ACCOUNTS else ""
+
+
+def _write_json(path, data):
+    """Write atomically so a crash mid-write can't corrupt the file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def default_accounts():
+    if DEFAULT_ACCOUNTS:
+        return [dict(a) for a in DEFAULT_ACCOUNTS]
+    return [{"tiktok": u, "youtube": _default_youtube_id, "format": "shorts"} for u in _seed_usernames]
+
+
+def load_config():
+    """Saved dashboard config if it exists (only survives with a volume),
+    otherwise the DEFAULT_ACCOUNTS baked into this file."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                data = json.load(f)
+            if isinstance(data.get("accounts"), list):
+                return data
+        except Exception:
+            log("WARNING: config.json unreadable - using DEFAULT_ACCOUNTS from the code.")
+    return {"accounts": default_accounts()}
+
+
+def save_config():
+    try:
+        _write_json(CONFIG_FILE, CONFIG)
+    except Exception as e:
+        log(f"WARNING: could not save config: {e}")
+
+
 # "format" per account row: "shorts" (default, vertical as-is) or "landscape"
 # (blurred-pillarbox crop to 16:9, posted as a normal long-form video, no #Shorts tag)
-CONFIG = {
-    "accounts": [{"tiktok": u, "youtube": _default_youtube_id, "format": "shorts"} for u in _seed_usernames]
-}
+CONFIG = load_config()
 
 
 def get_config():
@@ -109,30 +189,63 @@ def get_config():
         return dict(CONFIG)
 
 
+def get_posted_ids(history, history_key):
+    val = history.get(history_key, [])
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, list):
+        return val
+    return []
+
+
+def merge_history(base, extra):
+    """Union of posted IDs. Never removes anything."""
+    for key, val in extra.items():
+        cur = get_posted_ids(base, key)
+        for vid in get_posted_ids({key: val}, key):
+            vid = str(vid)
+            if vid not in cur:
+                cur.append(vid)
+        base[key] = cur
+    return base
+
+
 def load_history():
+    history = {}
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE) as f:
-            return json.load(f)
-    return {}
+        try:
+            with open(HISTORY_FILE) as f:
+                history = json.load(f)
+        except Exception:
+            log("WARNING: posted_history.json unreadable - starting from SEED_HISTORY.")
+            history = {}
+    return merge_history(history, SEED_HISTORY)
 
 
 def save_history(history):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2)
+    try:
+        _write_json(HISTORY_FILE, history)
+    except Exception as e:
+        log(f"WARNING: could not save history: {e}")
 
 
 def load_upload_limits():
     """Load when each YouTube channel hit upload limit"""
     if os.path.exists(UPLOAD_LIMIT_FILE):
-        with open(UPLOAD_LIMIT_FILE) as f:
-            return json.load(f)
+        try:
+            with open(UPLOAD_LIMIT_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 
 def save_upload_limits(limits):
     """Save upload limit timestamps"""
-    with open(UPLOAD_LIMIT_FILE, "w") as f:
-        json.dump(limits, f, indent=2)
+    try:
+        _write_json(UPLOAD_LIMIT_FILE, limits)
+    except Exception as e:
+        log(f"WARNING: could not save upload limits: {e}")
 
 
 def is_channel_limited(youtube_account_id, limits):
@@ -153,15 +266,6 @@ def is_channel_limited(youtube_account_id, limits):
         del limits[youtube_account_id]
         save_upload_limits(limits)
         return False
-
-
-def get_posted_ids(history, history_key):
-    val = history.get(history_key, [])
-    if isinstance(val, str):
-        return [val]
-    if isinstance(val, list):
-        return val
-    return []
 
 
 def get_google_creds(scopes, refresh_token, client_id, client_secret):
@@ -212,9 +316,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .badge.warn { color: var(--accent); border-color: rgba(255,59,92,0.35); background: rgba(255,59,92,0.08); }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
   label:first-of-type { margin-top: 0; }
-  input[type=text], select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  input[type=text], select, textarea { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
     padding: 8px 10px; color: var(--text); font-size: 13.5px; font-family: inherit; }
-  input[type=text]:focus, select:focus { outline: none; border-color: var(--accent-2); }
+  input[type=text]:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent-2); }
+  textarea { width: 100%; font-family: Consolas, monospace; font-size: 12px; }
   .account-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
   .account-row input[type=text] { flex: 1; min-width: 0; }
   .account-row select { flex: 1; min-width: 0; }
@@ -241,7 +346,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="logo">TT&gt;YT</div>
     <div>
       <h1>TikTok -&gt; YouTube Bot</h1>
-      <div class="sub">Watches TikTok accounts, reposts new videos to YouTube automatically</div>
+      <div class="sub">Watches TikTok accounts, reposts their videos to YouTube automatically</div>
     </div>
   </header>
 
@@ -250,16 +355,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <h2>Status</h2>
       <div class="badges">
         <div class="badge">Posted <b>@@DONE_COUNT@@</b></div>
-        <div class="badge">Checking every <b>@@INTERVAL@@h</b></div>
+        <div class="badge">Posts per day <b>@@PER_DAY@@</b></div>
         <div class="badge @@YT_WARN_CLASS@@">YouTube channels <b>@@YT_COUNT@@</b></div>
         <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
       </div>
       <h2 style="margin-top:20px;">Activity</h2>
       <div class="feed">@@FEED_CONTENT@@</div>
       <form method="POST" action="/trigger">
-        <button type="submit">Check All Now</button>
+        <button type="submit">Post Next Video Now</button>
       </form>
-      <div class="hint">Checks every monitored account immediately instead of waiting for the next scheduled check. Full technical logs are in your Railway deployment logs, not here.</div>
+      <div class="hint">Runs a check immediately instead of waiting for the next scheduled one. Each check posts one video per account. Full technical logs are in your Railway deployment logs, not here.</div>
     </div>
 
     <div class="card">
@@ -273,15 +378,29 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         <button type="submit">Save Accounts</button>
       </form>
       <div class="hint">
-        Every check cycle, the bot looks at each TikTok account's last @@LOOKBACK@@ videos. Any
-        that aren't already posted for that profile get queued up, oldest first, one upload per
-        cycle, to the YouTube channel selected for that row - so nothing gets silently skipped
-        even if several videos land between checks.
+        The bot reads each TikTok account's whole video list and posts the
+        <b>oldest video that hasn't been posted yet</b>, working forward to the newest.
+        One upload per check, @@PER_DAY@@ times a day. New TikToks join the end of the queue.
         <br><b>Shorts</b> posts the vertical video as-is with a #Shorts tag.
         <b>Landscape</b> crops it to 16:9 (blurred pillarbox, nothing is cut off) and posts it as
         a normal long-form video with no #Shorts tag.
+        <br>Accounts saved here last until the next redeploy. To make them permanent, edit
+        <b>DEFAULT_ACCOUNTS</b> at the top of the code.
         @@YT_HINT@@
       </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px;">
+    <h2>Posted History (backup)</h2>
+    <form method="POST" action="/import_history">
+      <textarea name="history" rows="6">@@HISTORY_JSON@@</textarea>
+      <button type="submit" class="secondary">Restore / Merge History</button>
+    </form>
+    <div class="hint">
+      This is the list of videos already posted. Copy it somewhere safe. If a redeploy ever wipes it,
+      paste it back here and click Restore. To make it permanent, paste the IDs into
+      <b>SEED_HISTORY</b> at the top of the code.
     </div>
   </div>
 
@@ -364,7 +483,7 @@ def render_feed_html():
     with status_lock:
         items = list(status_feed[-25:])
     if not items:
-        return '<div class="feed-empty">Nothing yet - click "Check All Now" or wait for the next scheduled check.</div>'
+        return '<div class="feed-empty">Nothing yet - click "Post Next Video Now" or wait for the next scheduled check.</div>'
     # newest first
     return "\n".join(f'<div class="feed-item">{item}</div>' for item in reversed(items))
 
@@ -384,7 +503,7 @@ def render_page():
 
     html = PAGE_TEMPLATE
     html = html.replace("@@DONE_COUNT@@", str(done_count))
-    html = html.replace("@@INTERVAL@@", str(POLL_INTERVAL_HOURS))
+    html = html.replace("@@PER_DAY@@", str(POSTS_PER_DAY))
     html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
     html = html.replace("@@RUNNING_TEXT@@", "Checking now" if running else "Idle")
     html = html.replace("@@YT_COUNT@@", str(len(YOUTUBE_ACCOUNTS)))
@@ -396,7 +515,7 @@ def render_page():
     html = html.replace("@@YOUTUBE_OPTIONS_JS@@", youtube_options_html().replace("`", "\\`"))
     html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
     html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
-    html = html.replace("@@LOOKBACK@@", str(LOOKBACK_COUNT))
+    html = html.replace("@@HISTORY_JSON@@", esc(json.dumps(history, indent=2)))
     return html
 
 
@@ -425,6 +544,15 @@ def parse_accounts_from_form(fields_multi):
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/history.json":
+            body = json.dumps(load_history(), indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         html = render_page()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -434,18 +562,34 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode() if length else ""
+
         if self.path == "/configure":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode() if length else ""
             fields_multi = urllib.parse.parse_qs(body)
             accounts = parse_accounts_from_form(fields_multi)
             with config_lock:
                 CONFIG["accounts"] = accounts
+                save_config()
             summary = ", ".join(
                 f"{a['tiktok']} -> {YOUTUBE_ACCOUNTS_BY_ID.get(a['youtube'], {}).get('label', a['youtube'])} ({a['format']})"
                 for a in accounts
             )
             log(f"Accounts updated -> {summary if accounts else '(none)'}")
+        elif self.path == "/import_history":
+            fields_multi = urllib.parse.parse_qs(body)
+            raw = fields_multi.get("history", [""])[0].strip()
+            try:
+                incoming = json.loads(raw)
+                if not isinstance(incoming, dict):
+                    raise ValueError("history must be a JSON object")
+                merged = merge_history(load_history(), incoming)
+                save_history(merged)
+                log(f"History restored/merged ({sum(len(get_posted_ids(merged, k)) for k in merged)} posted IDs).")
+                status("♻️ Posted history restored.")
+            except Exception as e:
+                log(f"History import failed: {e}")
+                status(f"❌ History import failed: {esc(str(e))}")
         elif self.path == "/trigger":
             log("Manual trigger received - checking all accounts now.")
             status("🔁 Manual check triggered.")
@@ -465,14 +609,16 @@ def start_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-def get_recent_tiktok_videos(username, limit=5):
+def get_all_tiktok_videos(username, limit=0):
+    """Return the account's videos sorted OLDEST FIRST. limit=0 means all."""
     profile_url = f"https://www.tiktok.com/@{username}"
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
-        "playlistend": limit,
     }
+    if limit and limit > 0:
+        ydl_opts["playlistend"] = limit
     if TIKTOK_COOKIES_FILE:
         ydl_opts["cookiefile"] = TIKTOK_COOKIES_FILE
 
@@ -488,11 +634,16 @@ def get_recent_tiktok_videos(username, limit=5):
         video_id = entry.get("id")
         if not video_id:
             continue
+        video_id = str(video_id)
         videos.append({
             "id": video_id,
             "title": entry.get("title") or f"TikTok video {video_id}",
             "url": entry.get("url") or f"https://www.tiktok.com/@{username}/video/{video_id}",
         })
+
+    # TikTok video IDs increase with upload time, so sorting by ID gives true
+    # chronological order (and ignores pinned videos sitting at the top).
+    videos.sort(key=lambda v: int(v["id"]) if v["id"].isdigit() else 0)
     return videos
 
 
@@ -679,6 +830,12 @@ def upload_to_youtube(file_path, title, description, youtube_account_id, limits)
             status(f"⏸️ YouTube upload limit hit on <b>{esc(account['label'])}</b> - paused 24h.")
             limits[youtube_account_id] = time.time()
             save_upload_limits(limits)
+        elif type(e).__name__ == "RefreshError" or "invalid_grant" in error_str:
+            # Token rejected: retrying every cycle is pointless until it's replaced.
+            log(f"  ❌ Refresh token rejected for '{account['label']}' - pausing this channel "
+                f"until the token is replaced and the bot is redeployed.")
+            status(f"🔑 YouTube token for <b>{esc(account['label'])}</b> was rejected - channel paused until you replace the token.")
+            auth_broken.add(youtube_account_id)
         else:
             log(f"  ❌ Upload failed: {type(e).__name__}: {e}")
             status(f"❌ Upload to <b>{esc(account['label'])}</b> failed: {esc(type(e).__name__)}")
@@ -695,6 +852,10 @@ def check_account(account, history, limits):
 
     log(f"Checking @{username} (-> {yt_label}, {video_format})...")
 
+    if youtube_id in auth_broken:
+        log(f"  Skipping: YouTube token for '{yt_label}' was rejected earlier - replace it and redeploy.")
+        return
+
     # Check if channel is in cooldown
     if is_channel_limited(youtube_id, limits):
         return
@@ -704,7 +865,7 @@ def check_account(account, history, limits):
         return
 
     try:
-        videos = get_recent_tiktok_videos(username, limit=LOOKBACK_COUNT)
+        videos = get_all_tiktok_videos(username, limit=LOOKBACK_COUNT)  # oldest first
     except Exception as e:
         log(f"  Failed to check TikTok: {e}")
         status(f"❌ Couldn't check @{esc(username)} on TikTok: {esc(type(e).__name__)}")
@@ -718,25 +879,37 @@ def check_account(account, history, limits):
 
     unposted = [v for v in videos if v["id"] not in posted_ids]
     if not unposted:
-        log("  No new video since last check.")
+        log("  Nothing left to post - every video on this profile is already posted.")
         return
 
-    if len(unposted) > 1:
-        log(f"  {len(unposted)} unposted videos found within the last {len(videos)} - "
-            f"posting the oldest of them now, the rest next cycle(s).")
+    log(f"  {len(unposted)} of {len(videos)} videos still waiting - posting the oldest now.")
 
-    video = unposted[-1]
-    tiktok_link = f'<a href="{esc(video["url"])}" target="_blank">TikTok source</a>'
+    candidates = [v for v in unposted if failed_downloads.get(v["id"], 0) < MAX_DOWNLOAD_FAILS]
+    if not candidates:
+        log("  Every remaining video has failed to download too many times - skipping this cycle.")
+        return
 
-    log(f"  New video found ({video['id']}) - downloading...")
-    status(f"📥 Found new video from @{esc(username)} - {tiktok_link}")
+    video = None
+    filepath = None
+    tiktok_link = ""
+    for cand in candidates[:MAX_DOWNLOAD_FAILS]:
+        cand_link = f'<a href="{esc(cand["url"])}" target="_blank">TikTok source</a>'
+        log(f"  Next video ({cand['id']}) - downloading...")
+        status(f"📥 Next video from @{esc(username)} - {cand_link}")
 
-    filepath = os.path.join(WORK_DIR, f"{video['id']}.mp4")
-    try:
-        download_tiktok_video(video["url"], filepath)
-    except Exception as e:
-        log(f"  Download failed: {e}")
-        status(f"❌ Download failed for @{esc(username)}'s video: {esc(type(e).__name__)}")
+        cand_path = os.path.join(WORK_DIR, f"{cand['id']}.mp4")
+        try:
+            download_tiktok_video(cand["url"], cand_path)
+        except Exception as e:
+            failed_downloads[cand["id"]] = failed_downloads.get(cand["id"], 0) + 1
+            log(f"  Download failed ({failed_downloads[cand['id']]}/{MAX_DOWNLOAD_FAILS}): {e}")
+            status(f"❌ Download failed for @{esc(username)}'s video: {esc(type(e).__name__)}")
+            continue
+
+        video, filepath, tiktok_link = cand, cand_path, cand_link
+        break
+
+    if video is None:
         return
 
     upload_path = filepath
@@ -771,7 +944,7 @@ def check_account(account, history, limits):
 
     if vid:
         posted_ids.append(video["id"])
-        history[history_key] = posted_ids[-50:]
+        history[history_key] = posted_ids  # keep everything so old videos are never re-posted
         save_history(history)
         log(f"  Done: @{username} -> {video['id']} posted to {yt_label}.")
         yt_link = f'<a href="https://youtube.com/watch?v={esc(vid)}" target="_blank">https://youtube.com/watch?v={esc(vid)}</a>'
@@ -810,17 +983,18 @@ def run_pipeline():
 def autopilot_loop():
     wait_seconds = STARTUP_WAIT_HOURS * 3600
     log(f"Startup window: waiting {STARTUP_WAIT_HOURS}h before the first check. "
-        f"Visit the dashboard to add TikTok accounts, or click 'Check All Now' to skip the wait.")
+        f"Visit the dashboard to add TikTok accounts, or click 'Post Next Video Now' to skip the wait.")
     while True:
         next_run_at[0] = time.time() + wait_seconds
         trigger_event.wait(timeout=wait_seconds)
         trigger_event.clear()
         run_pipeline()
         wait_seconds = POLL_INTERVAL_HOURS * 3600
-        log(f"Sleeping {POLL_INTERVAL_HOURS}h until next check (or trigger manually anytime)...")
+        log(f"Sleeping {POLL_INTERVAL_HOURS}h until next check ({POSTS_PER_DAY} posts/day, or trigger manually anytime)...")
 
 
 def main():
+    log(f"Data folder: {DATA_DIR}")
     if TIKTOK_COOKIES_FILE:
         if os.path.exists(TIKTOK_COOKIES_FILE):
             n_lines = sum(1 for _ in open(TIKTOK_COOKIES_FILE))
