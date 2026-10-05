@@ -23,6 +23,8 @@ from googleapiclient.http import MediaFileUpload
 # "format" is "shorts" or "landscape".
 DEFAULT_ACCOUNTS = [
     {"tiktok": "movierecap.wow", "youtube": "default", "format": "shorts"},
+    {"tiktok": "happylittlegc4", "youtube": "jasonranks", "format": "shorts"},
+    {"tiktok": "lightofdeendaily0", "youtube": "jasonranks", "format": "shorts"},
 ]
 
 # Videos that are already posted, so they never get posted twice after a
