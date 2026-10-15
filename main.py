@@ -118,7 +118,7 @@ OVERLAY_TEXT = {
 }
 
 OVERLAY_ON = True          # set False to turn all text overlays off
-OVERLAY_Y_PCT = 30         # vertical centre of the text, % from the top
+OVERLAY_Y_PCT = 20         # vertical centre of the text, % from the top
 OVERLAY_FONT_SIZE = 64     # pixels (video is 1080 wide)
 OVERLAY_WRAP = 20          # max characters per line before wrapping
 
