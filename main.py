@@ -2,18 +2,21 @@
 
 - Upload clips into sections on the dashboard.
 - Each run picks one random clip per section (in order), MUTES them, puts a
-  random text overlay on each one (about 30% from the top), stitches them into
+  random text overlay on each one (about 20% from the top), stitches them into
   one vertical 1080x1920 video, and lays a background track over it.
 - The music crossfades into itself when it loops (no hard stop/restart), fades
   in at the start and fades out at the end.
 - Music comes from uploaded audio files OR a TikTok / Instagram Reel link
   (the bot pulls that post's sound).
 - Posts through Zernio and PUBLISHES straight away by default (no drafts to edit).
+- Supports TWO Zernio API keys, so you can post to more accounts
+  (e.g. key 1 = TikTok + YouTube, key 2 = Instagram + Facebook).
 - Clips, music, links, settings and history are committed to a GitHub repo so
   everything survives redeploys.
 
 Railway env vars:
-  ZERNIO_API_KEY      required for posting
+  ZERNIO_API_KEY      required for posting (first Zernio account)
+  ZERNIO_API_KEY_2    optional, second Zernio account (e.g. Instagram + Facebook)
   GITHUB_TOKEN        token with read/write Contents access to the repo
   GITHUB_REPO         owner/name of a PRIVATE repo, e.g. icom/ugc-store
   GITHUB_BRANCH       optional, default main
@@ -117,10 +120,19 @@ OVERLAY_TEXT = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# Text look. Change these to restyle the overlays.
+# ---------------------------------------------------------------------------
 OVERLAY_ON = True          # set False to turn all text overlays off
 OVERLAY_Y_PCT = 20         # vertical centre of the text, % from the top
 OVERLAY_FONT_SIZE = 64     # pixels (video is 1080 wide)
 OVERLAY_WRAP = 20          # max characters per line before wrapping
+OVERLAY_LINE_SPACING = 1.3 # line height as a multiple of the font size
+OVERLAY_COLOR = "white"    # text colour (name like yellow, or hex like 0xFFD400)
+OVERLAY_BORDER = 4         # black outline thickness in px (0 = no outline)
+OVERLAY_SHADOW = 0         # drop shadow distance in px (0 = none, try 3)
+OVERLAY_BOX = False        # True = dark box behind the text (old look)
+OVERLAY_BOX_OPACITY = 0.45 # box darkness if OVERLAY_BOX is True (0 to 1)
 
 # Music loop / fade lengths (seconds)
 MUSIC_FADE_IN = 1.0
@@ -137,6 +149,8 @@ mimetypes.add_type("audio/aac", ".aac")
 mimetypes.add_type("audio/opus", ".opus")
 
 ZERNIO_API_KEY = os.environ.get("ZERNIO_API_KEY", "")
+ZERNIO_API_KEYS = [k.strip() for k in (os.environ.get("ZERNIO_API_KEY", ""),
+                                       os.environ.get("ZERNIO_API_KEY_2", "")) if k and k.strip()]
 ZERNIO_BASE = "https://zernio.com/api/v1"
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
@@ -533,7 +547,11 @@ def delete_music_link(lid):
 # ---------------------------------------------------------------------------
 # Text overlay helpers
 # ---------------------------------------------------------------------------
-FONT_URL = "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf"
+FONT_URLS = [
+    "https://github.com/dejavu-fonts/dejavu-fonts/raw/version_2_37/ttf/DejaVuSans-Bold.ttf",
+    "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf",
+    "https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts@version_2_37/ttf/DejaVuSans-Bold.ttf",
+]
 FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
@@ -548,32 +566,39 @@ _font_cache = [None]
 
 def find_font():
     """Path to a usable bold .ttf, or '' if none can be found/downloaded."""
-    if _font_cache[0] is not None:
-        return _font_cache[0]
-    found = ""
-    for p in [os.environ.get("FONT_FILE", "")] + FONT_PATHS + [FONT_CACHE_FILE]:
-        if p and os.path.isfile(p):
-            found = p
-            break
+    if _font_cache[0]:
+        return _font_cache[0]          # only cache successes, so failures retry
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = ([os.environ.get("FONT_FILE", "")] + FONT_PATHS +
+                  [FONT_CACHE_FILE, os.path.join(here, "font.ttf"),
+                   os.path.join(STORE_DIR, "font.ttf")])
+    found = next((p for p in candidates if p and os.path.isfile(p)), "")
     if not found:
         try:
-            r = subprocess.run(["fc-match", "-f", "%{file}", "sans:bold"], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["fc-match", "-f", "%{file}", "sans:bold"],
+                               capture_output=True, text=True, timeout=10)
             p = r.stdout.strip()
             if p and os.path.isfile(p):
                 found = p
         except Exception:
             pass
     if not found:
-        try:
-            r = requests.get(FONT_URL, timeout=30)
-            if r.status_code == 200 and len(r.content) > 50_000:
-                with open(FONT_CACHE_FILE, "wb") as f:
-                    f.write(r.content)
-                found = FONT_CACHE_FILE
-                log(f"Downloaded overlay font to {FONT_CACHE_FILE}")
-        except Exception as e:
-            log(f"Could not download overlay font: {e}")
-    _font_cache[0] = found
+        for url in FONT_URLS:
+            try:
+                r = requests.get(url, timeout=30)
+                ok = (r.status_code == 200 and len(r.content) > 50_000
+                      and r.content[:4] in (b"\x00\x01\x00\x00", b"true", b"OTTO"))
+                if ok:
+                    with open(FONT_CACHE_FILE, "wb") as f:
+                        f.write(r.content)
+                    found = FONT_CACHE_FILE
+                    log(f"Downloaded overlay font from {url}")
+                    break
+                log(f"Font download failed ({r.status_code}, {len(r.content)} bytes): {url}")
+            except Exception as e:
+                log(f"Font download error: {url}: {e}")
+    if found:
+        _font_cache[0] = found
     return found
 
 
@@ -588,17 +613,23 @@ def text_filters(text, workdir, idx, font):
     lines = textwrap.wrap(text, width=OVERLAY_WRAP) or []
     if not lines:
         return ""
-    line_h = int(OVERLAY_FONT_SIZE * 1.6)
+    line_h = int(OVERLAY_FONT_SIZE * OVERLAY_LINE_SPACING)
     top = int(1920 * OVERLAY_Y_PCT / 100 - len(lines) * line_h / 2)
     filters = []
     for j, line in enumerate(lines):
         path = os.path.join(workdir, f"t{idx}_{j}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(line)
+        style = f"fontsize={OVERLAY_FONT_SIZE}:fontcolor={OVERLAY_COLOR}:"
+        if OVERLAY_BORDER > 0:
+            style += f"borderw={OVERLAY_BORDER}:bordercolor=black:"
+        if OVERLAY_SHADOW > 0:
+            style += f"shadowx={OVERLAY_SHADOW}:shadowy={OVERLAY_SHADOW}:shadowcolor=black@0.7:"
+        if OVERLAY_BOX:
+            style += f"box=1:boxcolor=black@{OVERLAY_BOX_OPACITY}:boxborderw=14:"
         filters.append(
             f"drawtext=fontfile='{font}':textfile='{path}':expansion=none:"
-            f"fontsize={OVERLAY_FONT_SIZE}:fontcolor=white:borderw=3:bordercolor=black:"
-            f"box=1:boxcolor=black@0.45:boxborderw=14:x=(w-text_w)/2:y={top + j * line_h}"
+            f"{style}x=(w-text_w)/2:y={top + j * line_h}"
         )
     return ",".join(filters)
 
@@ -773,10 +804,10 @@ def build_video(history, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Zernio posting
+# Zernio posting (supports up to two API keys / Zernio accounts)
 # ---------------------------------------------------------------------------
-def _zh(js=False):
-    h = {"Authorization": f"Bearer {ZERNIO_API_KEY}"}
+def _zh(key, js=False):
+    h = {"Authorization": f"Bearer {key}"}
     if js:
         h["Content-Type"] = "application/json"
     return h
@@ -786,19 +817,24 @@ _acc_cache = {"t": 0, "data": [], "error": ""}
 
 
 def zernio_accounts(force=False):
-    if not ZERNIO_API_KEY:
+    if not ZERNIO_API_KEYS:
         _acc_cache["error"] = "ZERNIO_API_KEY not set"
         return []
     if not force and time.time() - _acc_cache["t"] < 60:
         return _acc_cache["data"]
-    try:
-        r = requests.get(f"{ZERNIO_BASE}/accounts", headers=_zh(), timeout=20)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
-        _acc_cache.update(t=time.time(), data=r.json().get("accounts", []), error="")
-    except Exception as e:
-        _acc_cache.update(t=time.time(), error=str(e))
-    return _acc_cache["data"]
+    allacc, errs = [], []
+    for idx, key in enumerate(ZERNIO_API_KEYS):
+        try:
+            r = requests.get(f"{ZERNIO_BASE}/accounts", headers=_zh(key), timeout=20)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code} {r.text[:120]}")
+            for a in r.json().get("accounts", []):
+                a["_key"] = idx          # remembers which API key owns this account
+                allacc.append(a)
+        except Exception as e:
+            errs.append(f"key {idx + 1}: {e}")
+    _acc_cache.update(t=time.time(), data=allacc, error="; ".join(errs))
+    return allacc
 
 
 def post_via_zernio(path, cfg):
@@ -807,12 +843,14 @@ def post_via_zernio(path, cfg):
     if not chosen:
         chosen = [a for a in accounts if a.get("platform") == "tiktok"][:1]
     if not chosen:
-        raise RuntimeError("no destination: connect a TikTok account in Zernio and pick it on the dashboard")
+        raise RuntimeError("no destination: connect an account in Zernio and pick it on the dashboard")
 
     caption = random.choice(cfg["captions"]) if cfg["captions"] else "New video"
     title = caption.split("#")[0].strip()[:100] or "New video"
 
-    p = requests.post(f"{ZERNIO_BASE}/media/presign", headers=_zh(True), timeout=30,
+    # upload the video once, reuse the public URL for every key
+    first_key = ZERNIO_API_KEYS[chosen[0]["_key"]]
+    p = requests.post(f"{ZERNIO_BASE}/media/presign", headers=_zh(first_key, True), timeout=30,
                       json={"filename": "ugc.mp4", "contentType": "video/mp4"})
     if p.status_code >= 300:
         raise RuntimeError(f"presign failed: {p.status_code} {p.text[:200]}")
@@ -822,30 +860,42 @@ def post_via_zernio(path, cfg):
     if put.status_code >= 300:
         raise RuntimeError(f"media upload failed: {put.status_code} {put.text[:200]}")
 
-    body = {
-        "content": caption[:2200],
-        "title": title,
-        "publishNow": True,
-        "visibility": "public",
-        "platforms": [{"platform": a["platform"], "accountId": a["_id"]} for a in chosen],
-        "mediaItems": [{"type": "video", "url": info["publicUrl"]}],
-    }
-    if any(a["platform"] == "tiktok" for a in chosen):
-        body["tiktokSettings"] = {
-            "draft": bool(cfg["tiktok_draft"]),
-            "privacy_level": "PUBLIC_TO_EVERYONE",
-            "allow_comment": True, "allow_duet": True, "allow_stitch": True,
-            "commercial_content_type": "none",
-            "content_preview_confirmed": True, "express_consent_given": True,
-            "media_type": "video", "auto_add_music": False, "video_made_with_ai": False,
+    ids, names_all, errors = [], [], []
+    for kidx in sorted({a["_key"] for a in chosen}):
+        group = [a for a in chosen if a["_key"] == kidx]
+        body = {
+            "content": caption[:2200],
+            "title": title,
+            "publishNow": True,
+            "visibility": "public",
+            "platforms": [{"platform": a["platform"], "accountId": a["_id"]} for a in group],
+            "mediaItems": [{"type": "video", "url": info["publicUrl"]}],
         }
-    r = requests.post(f"{ZERNIO_BASE}/posts", headers=_zh(True), json=body, timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"create post failed: {r.status_code} {r.text[:300]}")
-    post = r.json().get("post", {})
-    names = ", ".join(f"{a['platform']}:{a.get('username', '')}" for a in chosen)
-    log(f"  Zernio accepted post {post.get('_id')} -> {names} ({post.get('status')})")
-    return post.get("_id") or "sent", names
+        if any(a["platform"] == "tiktok" for a in group):
+            body["tiktokSettings"] = {
+                "draft": bool(cfg["tiktok_draft"]),
+                "privacy_level": "PUBLIC_TO_EVERYONE",
+                "allow_comment": True, "allow_duet": True, "allow_stitch": True,
+                "commercial_content_type": "none",
+                "content_preview_confirmed": True, "express_consent_given": True,
+                "media_type": "video", "auto_add_music": False, "video_made_with_ai": False,
+            }
+        names = ", ".join(f"{a['platform']}:{a.get('username', '')}" for a in group)
+        try:
+            r = requests.post(f"{ZERNIO_BASE}/posts", headers=_zh(ZERNIO_API_KEYS[kidx], True), json=body, timeout=60)
+            if r.status_code >= 300:
+                raise RuntimeError(f"{r.status_code} {r.text[:300]}")
+            post = r.json().get("post", {})
+            ids.append(post.get("_id") or "sent")
+            names_all.append(names)
+            log(f"  Zernio accepted post {post.get('_id')} -> {names} ({post.get('status')})")
+        except Exception as e:
+            errors.append(f"{names}: {e}")
+    if errors and not ids:
+        raise RuntimeError("create post failed: " + " | ".join(errors))
+    if errors:
+        status(f"⚠️ Some destinations failed: {esc(' | '.join(errors)[:250])}")
+    return ", ".join(ids), ", ".join(names_all)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,9 +1138,9 @@ def render_music():
 
 def render_dests(cfg):
     accounts = zernio_accounts()
+    err = _acc_cache["error"]
     if not accounts:
-        err = _acc_cache["error"] or "none found"
-        return f'<div class="empty">No Zernio accounts loaded ({esc(err)}).</div>'
+        return f'<div class="empty">No Zernio accounts loaded ({esc(err or "none found")}).</div>'
     sel = set(cfg["destinations"])
     if not sel:
         first = next((a for a in accounts if a.get("platform") == "tiktok"), None)
@@ -1098,10 +1148,13 @@ def render_dests(cfg):
     rows = []
     for a in accounts:
         chk = "checked" if a["_id"] in sel else ""
+        tag = f' <span style="color:var(--muted)">(key {a.get("_key", 0) + 1})</span>' if len(ZERNIO_API_KEYS) > 1 else ""
         rows.append(
             f'<div class="chk"><input type="checkbox" name="dest" value="{esc(a["_id"])}" {chk}>'
-            f'{esc(a.get("platform"))} &middot; {esc(a.get("username") or a.get("displayName"))}</div>'
+            f'{esc(a.get("platform"))} &middot; {esc(a.get("username") or a.get("displayName"))}{tag}</div>'
         )
+    if err:
+        rows.append(f'<div class="hint" style="color:var(--a)">Some accounts could not be loaded: {esc(err)}</div>')
     return "\n".join(rows)
 
 
@@ -1112,7 +1165,7 @@ def render_page():
     if not HAS_VOLUME and not SYNC_ON:
         warnings.append("No volume and no GitHub sync - uploaded clips are lost on every redeploy. "
                         "Set GITHUB_TOKEN + GITHUB_REPO (or add a Railway volume at /data).")
-    if not ZERNIO_API_KEY:
+    if not ZERNIO_API_KEYS:
         warnings.append("ZERNIO_API_KEY is not set - posting is disabled.")
     if SYNC_ON and sync_info["state"] == "error":
         warnings.append("GitHub sync problem: " + sync_info["msg"])
@@ -1386,8 +1439,10 @@ def main():
         log(f"GitHub sync ON -> {GITHUB_REPO or 'custom remote'} ({GITHUB_BRANCH})")
     else:
         log("GitHub sync OFF - set GITHUB_TOKEN and GITHUB_REPO so clips survive redeploys.")
-    if not ZERNIO_API_KEY:
+    if not ZERNIO_API_KEYS:
         log("WARNING: ZERNIO_API_KEY not set - posting disabled (preview still works).")
+    else:
+        log(f"Zernio API keys loaded: {len(ZERNIO_API_KEYS)}")
     for tool in ("ffmpeg", "ffprobe") + (("git",) if SYNC_ON else ()):
         if not shutil.which(tool):
             log(f"WARNING: {tool} not found on PATH.")
