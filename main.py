@@ -68,10 +68,10 @@ SECTIONS = [
 # ===========================================================================
 OVERLAY_TEXT = {
     "intro": [
-        "How to make UGC videos with AI",
-        "Make a UGC video in minutes with AI",
-        "This AI workflow makes UGC for you",
-        "I make UGC videos with AI. Here's how",
+        "",
+        "",
+        "",
+        " ",
     ],
     "open_claude": [
         "Open Claude",
